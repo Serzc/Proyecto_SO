@@ -1,0 +1,24 @@
+flowchart LR
+  OTROS["Otros nodos<br/>(malla completa TCP:<br/>puertos de datos,<br/>control y heartbeat)"]
+  subgraph NODO["Nodo k (un proceso dsmnode)"]
+    H["Manejador SIGSEGV<br/>(calcula página, envía<br/>solicitud, sem_wait)"]
+    APP["Hilos de usuario<br/>(acceden a la<br/>memoria compartida)"]
+    HB["Hilo de heartbeat"]
+    NET["Hilo de red<br/>(poll de sockets)"]
+    SVC["Hilos de servicio<br/>(PAGE_REQUEST y FREE<br/>en el home)"]
+    PEND["Tabla de pendientes<br/>(seq y sem_t)"]
+    MEM["Memoria compartida<br/>(vista de aplicación<br/>y vista de sistema)"]
+    TAB["Tabla de páginas<br/>y tabla de nodos"]
+    CLI["Consola"]
+  end
+  APP -- "SIGSEGV" --> H
+  H -- "PAGE_REQUEST" --> OTROS
+  HB -- "HEARTBEAT" --> OTROS
+  SVC -- "INVALIDATE, PAGE_DATA" --> OTROS
+  OTROS -- "mensajes entrantes" --> NET
+  H -- "registra" --> PEND
+  NET -- "sem_post" --> PEND
+  NET -- "copia y mprotect" --> MEM
+  NET -- "actualiza" --> TAB
+  NET -- "delega" --> SVC
+  CLI -- "consulta" --> TAB
