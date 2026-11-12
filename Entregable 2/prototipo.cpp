@@ -15,8 +15,10 @@
 #include <memory>
 #include <mutex>
 #include <netdb.h>
+#include <optional>
 #include <poll.h>
 #include <semaphore.h>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -38,7 +40,23 @@ constexpr std::uint8_t NODE_NONE = 0xFF;
 constexpr std::uint32_t PAGE_NONE = 0xFFFFFFFF;
 constexpr std::uint8_t HEARTBEAT_PORT_ROLE = 2;
 constexpr std::uint8_t HEARTBEAT_MESSAGE = 3;
+constexpr std::uint8_t DEMO_MESSAGE = 0x80;
+constexpr std::uint8_t DEMO_BROADCAST = 1;
+constexpr std::uint8_t DEMO_UNICAST = 2;
 constexpr std::size_t MESSAGE_HEADER_SIZE = 16;
+constexpr std::size_t DEMO_MAX_BYTES = 1024;
+constexpr std::size_t CHANNEL_COUNT = 3;
+std::mutex console_output_mutex;
+
+// Demo-only message type; this does not add a DSM operation to section 5.
+// Each broadcast is sent as one unicast TCP frame to every configured peer.
+// MSI access policy below models the section 2.4 transitions; data messages
+// do not perform page transfers or change page-table states.
+enum class Channel : std::uint8_t {
+    Data = 0,
+    Control = 1,
+    Heartbeat = HEARTBEAT_PORT_ROLE
+};
 
 enum class NodeState : std::uint8_t {
     Offline = 0,
@@ -50,6 +68,43 @@ enum class PageState : std::uint8_t {
     Shared = 1,
     Modified = 2
 };
+
+enum class PageAccess {
+    Read,
+    Write
+};
+
+struct MsiAccessPolicy {
+    PageState granted_state;
+    bool request_home;
+    bool invalidate_other_copies;
+    bool retry_access;
+};
+
+MsiAccessPolicy msiPolicyForAccess(PageState state, PageAccess access) {
+    if (state == PageState::Modified ||
+        (state == PageState::Shared && access == PageAccess::Read)) {
+        return {state, false, false, false};
+    }
+    if (state == PageState::Invalid) {
+        return {PageState::Shared, true, false, access == PageAccess::Write};
+    }
+    return {PageState::Modified, true, true, false};
+}
+
+PageState msiOwnerStateAfterRequest(PageState owner_state, PageAccess access) {
+    if (access == PageAccess::Read && owner_state == PageState::Modified) {
+        return PageState::Shared;
+    }
+    if (access == PageAccess::Write) {
+        return PageState::Invalid;
+    }
+    return owner_state;
+}
+
+constexpr PageState msiStateAfterInvalidation() {
+    return PageState::Invalid;
+}
 
 enum class MessageType : std::uint8_t {
     Join = 1,
@@ -191,7 +246,7 @@ public:
         last_seen_[local_node_id_] = Clock::now();
     }
 
-    bool recordHeartbeat(std::uint8_t node_id, std::uint32_t source_ipv4) {
+    bool recordContact(std::uint8_t node_id, std::uint32_t source_ipv4) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (node_id >= node_count_ || node_id == local_node_id_ ||
             entries_[node_id].ipv4 != source_ipv4) {
@@ -368,6 +423,13 @@ std::uint16_t heartbeatPort(const Config& config, std::uint8_t node_id) {
         HEARTBEAT_PORT_ROLE);
 }
 
+std::uint16_t channelPort(const Config& config, std::uint8_t node_id,
+                          Channel channel) {
+    return static_cast<std::uint16_t>(
+        config.port_base + 3U * static_cast<std::uint16_t>(node_id) +
+        static_cast<std::uint8_t>(channel));
+}
+
 class Node {
 public:
     Node(Config config, std::uint8_t node_id)
@@ -381,7 +443,8 @@ public:
             peer_addresses_[id].sin_family = AF_INET;
             peer_addresses_[id].sin_addr.s_addr = resolveIPv4(config_.hosts[id]);
             const auto peer_id = static_cast<std::uint8_t>(id);
-            peer_addresses_[id].sin_port = htons(heartbeatPort(config_, peer_id));
+            peer_addresses_[id].sin_port =
+                htons(channelPort(config_, peer_id, Channel::Heartbeat));
             node_table_.configureNode(peer_id, peer_addresses_[id].sin_addr.s_addr);
         }
 
@@ -408,7 +471,9 @@ public:
         }
 
         try {
-            heartbeat_listener_ = openHeartbeatListener();
+            for (std::size_t role = 0; role < CHANNEL_COUNT; ++role) {
+                listeners_[role] = openListener(static_cast<Channel>(role));
+            }
             node_table_.markLocalOnline();
             network_thread_ = std::thread(&Node::networkLoop, this);
             heartbeat_thread_ = std::thread(&Node::heartbeatLoop, this);
@@ -417,9 +482,11 @@ public:
             if (network_thread_.joinable()) {
                 network_thread_.join();
             }
-            if (heartbeat_listener_ >= 0) {
-                close(heartbeat_listener_);
-                heartbeat_listener_ = -1;
+            for (int& listener : listeners_) {
+                if (listener >= 0) {
+                    close(listener);
+                    listener = -1;
+                }
             }
             throw;
         }
@@ -433,9 +500,11 @@ public:
         if (heartbeat_thread_.joinable()) {
             heartbeat_thread_.join();
         }
-        if (heartbeat_listener_ >= 0) {
-            close(heartbeat_listener_);
-            heartbeat_listener_ = -1;
+        for (int& listener : listeners_) {
+            if (listener >= 0) {
+                close(listener);
+                listener = -1;
+            }
         }
 
         joinThreads(service_threads_, service_threads_mutex_);
@@ -486,18 +555,62 @@ public:
         return node_id_;
     }
 
+    bool sendDemoMessage(std::optional<std::uint8_t> target, Channel channel,
+                         const std::string& message) const {
+        if (channel == Channel::Heartbeat || message.empty() ||
+            message.size() > DEMO_MAX_BYTES || message.size() > config_.page_size) {
+            return false;
+        }
+
+        const auto sendTo = [&](std::uint8_t peer_id, std::uint8_t flags) {
+            MsgHeader header{};
+            header.type = DEMO_MESSAGE;
+            header.sender = node_id_;
+            header.flags = flags;
+            header.seq = next_sequence_.fetch_add(1);
+            header.page = PAGE_NONE;
+            return sendFrame(peer_id, channel, header,
+                             reinterpret_cast<const std::uint8_t*>(message.data()),
+                             message.size());
+        };
+
+        if (target.has_value()) {
+            if (*target >= config_.num_hosts || *target == node_id_) {
+                return false;
+            }
+            return sendTo(*target, DEMO_UNICAST);
+        }
+
+        bool success = true;
+        bool has_peer = false;
+        for (std::size_t id = 0; id < config_.num_hosts; ++id) {
+            if (id == node_id_) {
+                continue;
+            }
+            has_peer = true;
+            if (!sendTo(static_cast<std::uint8_t>(id), DEMO_BROADCAST)) {
+                success = false;
+            }
+        }
+        return has_peer && success;
+    }
+
 private:
-    struct HeartbeatConnection {
+    struct Connection {
         int fd;
-        std::array<std::uint8_t, MESSAGE_HEADER_SIZE> bytes{};
-        std::size_t received = 0;
+        Channel channel;
+        std::array<std::uint8_t, MESSAGE_HEADER_SIZE> header_bytes{};
+        std::size_t header_received = 0;
+        MsgHeader header{};
+        std::vector<std::uint8_t> payload;
+        std::size_t payload_received = 0;
         std::uint32_t peer_ipv4 = 0;
     };
 
-    int openHeartbeatListener() const {
+    int openListener(Channel channel) const {
         const int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
-            throw std::runtime_error("socket() falló para el canal de heartbeat");
+            throw std::runtime_error("socket() falló al abrir un canal TCP");
         }
 
         int reuse_address = 1;
@@ -510,23 +623,25 @@ private:
         sockaddr_in local_address{};
         local_address.sin_family = AF_INET;
         local_address.sin_addr.s_addr = htonl(INADDR_ANY);
-        local_address.sin_port = htons(heartbeatPort(config_, node_id_));
+        local_address.sin_port = htons(channelPort(config_, node_id_, channel));
         if (bind(fd, reinterpret_cast<sockaddr*>(&local_address),
                  sizeof(local_address)) < 0) {
             const std::string error = std::strerror(errno);
             close(fd);
-            throw std::runtime_error("No se pudo abrir el puerto de heartbeat " +
+            throw std::runtime_error("No se pudo abrir el puerto " +
                                      std::to_string(ntohs(local_address.sin_port)) +
                                      ": " + error);
         }
         if (listen(fd, MAX_NODES) < 0) {
             const std::string error = std::strerror(errno);
             close(fd);
-            throw std::runtime_error("listen() falló en el puerto de heartbeat: " + error);
+            throw std::runtime_error("listen() falló en el puerto " +
+                                     std::to_string(ntohs(local_address.sin_port)) +
+                                     ": " + error);
         }
         if (!setNonBlocking(fd)) {
             close(fd);
-            throw std::runtime_error("No se pudo configurar el listener como no bloqueante");
+            throw std::runtime_error("No se pudo configurar el listener TCP como no bloqueante");
         }
         return fd;
     }
@@ -537,11 +652,13 @@ private:
     }
 
     void networkLoop() {
-        std::vector<HeartbeatConnection> connections;
+        std::vector<Connection> connections;
         while (running_) {
             std::vector<pollfd> descriptors;
-            descriptors.reserve(connections.size() + 1);
-            descriptors.push_back({heartbeat_listener_, POLLIN, 0});
+            descriptors.reserve(connections.size() + CHANNEL_COUNT);
+            for (const int listener : listeners_) {
+                descriptors.push_back({listener, POLLIN, 0});
+            }
             for (const auto& connection : connections) {
                 descriptors.push_back({connection.fd, POLLIN, 0});
             }
@@ -551,26 +668,32 @@ private:
                 if (errno == EINTR) {
                     continue;
                 }
-                std::cerr << "poll() falló en el listener de heartbeat: "
+                std::cerr << "poll() falló en los listeners TCP: "
                           << std::strerror(errno) << '\n';
                 running_ = false;
                 break;
             }
 
-            const std::size_t polled_connections = descriptors.size() - 1;
+            const std::size_t polled_connections =
+                descriptors.size() - CHANNEL_COUNT;
             for (std::size_t index = polled_connections; index > 0; --index) {
                 const std::size_t connection_index = index - 1;
-                const short events = descriptors[connection_index + 1].revents;
+                const short events =
+                    descriptors[CHANNEL_COUNT + connection_index].revents;
                 if (events != 0 &&
-                    !readHeartbeat(connections[connection_index], events)) {
+                    !readMessage(connections[connection_index], events)) {
                     close(connections[connection_index].fd);
                     connections.erase(connections.begin() +
                                       static_cast<std::ptrdiff_t>(connection_index));
                 }
             }
 
-            if (ready > 0 && (descriptors[0].revents & POLLIN) != 0) {
-                acceptHeartbeats(connections);
+            if (ready > 0) {
+                for (std::size_t role = 0; role < CHANNEL_COUNT; ++role) {
+                    if ((descriptors[role].revents & POLLIN) != 0) {
+                        acceptConnections(static_cast<Channel>(role), connections);
+                    }
+                }
             }
         }
 
@@ -579,11 +702,14 @@ private:
         }
     }
 
-    void acceptHeartbeats(std::vector<HeartbeatConnection>& connections) {
+    void acceptConnections(Channel channel, std::vector<Connection>& connections) {
         while (running_) {
+            if (connections.size() >= MAX_NODES * CHANNEL_COUNT) {
+                return;
+            }
             sockaddr_in peer_address{};
             socklen_t address_length = sizeof(peer_address);
-            const int fd = accept(heartbeat_listener_,
+            const int fd = accept(listeners_[static_cast<std::size_t>(channel)],
                                   reinterpret_cast<sockaddr*>(&peer_address),
                                   &address_length);
             if (fd < 0) {
@@ -593,7 +719,7 @@ private:
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     return;
                 }
-                std::cerr << "accept() falló en el listener de heartbeat: "
+                std::cerr << "accept() falló en el listener TCP: "
                           << std::strerror(errno) << '\n';
                 return;
             }
@@ -601,50 +727,112 @@ private:
                 close(fd);
                 continue;
             }
-            connections.push_back({fd, {}, 0, peer_address.sin_addr.s_addr});
+            Connection connection{};
+            connection.fd = fd;
+            connection.channel = channel;
+            connection.peer_ipv4 = peer_address.sin_addr.s_addr;
+            connections.push_back(std::move(connection));
         }
     }
 
-    bool readHeartbeat(HeartbeatConnection& connection, short events) {
+    bool readMessage(Connection& connection, short events) {
         if ((events & POLLNVAL) != 0) {
             return false;
         }
         const bool peer_closed = (events & (POLLERR | POLLHUP)) != 0;
 
-        while (connection.received < connection.bytes.size()) {
+        while (connection.header_received < connection.header_bytes.size()) {
             const ssize_t count = recv(
-                connection.fd, connection.bytes.data() + connection.received,
-                connection.bytes.size() - connection.received, 0);
+                connection.fd,
+                connection.header_bytes.data() + connection.header_received,
+                connection.header_bytes.size() - connection.header_received, 0);
             if (count > 0) {
-                connection.received += static_cast<std::size_t>(count);
+                connection.header_received += static_cast<std::size_t>(count);
+            } else if (count == 0) {
+                return false;
+            } else if (errno == EINTR) {
                 continue;
-            }
-            if (count == 0) {
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return !peer_closed;
+            } else {
                 return false;
             }
-            if (errno == EINTR) {
+        }
+
+        if (connection.payload.empty() && connection.payload_received == 0) {
+            std::memcpy(&connection.header, connection.header_bytes.data(),
+                        sizeof(connection.header));
+            connection.header.seq = ntohl(connection.header.seq);
+            connection.header.page = ntohl(connection.header.page);
+            connection.header.payload_len = ntohl(connection.header.payload_len);
+
+            const bool heartbeat =
+                connection.header.type == HEARTBEAT_MESSAGE &&
+                connection.channel == Channel::Heartbeat &&
+                connection.header.status == 0 && connection.header.flags == 0 &&
+                connection.header.page == PAGE_NONE &&
+                connection.header.payload_len == 0;
+            const bool demo =
+                connection.header.type == DEMO_MESSAGE &&
+                connection.channel != Channel::Heartbeat &&
+                connection.header.status == 0 &&
+                (connection.header.flags == DEMO_BROADCAST ||
+                 connection.header.flags == DEMO_UNICAST) &&
+                connection.header.page == PAGE_NONE &&
+                connection.header.payload_len > 0 &&
+                connection.header.payload_len <= DEMO_MAX_BYTES &&
+                connection.header.payload_len <= config_.page_size;
+            if ((!heartbeat && !demo) ||
+                connection.header.sender >= config_.num_hosts ||
+                connection.header.sender == node_id_) {
+                return false;
+            }
+            connection.payload.resize(connection.header.payload_len);
+        }
+
+        while (connection.payload_received < connection.payload.size()) {
+            const ssize_t count = recv(
+                connection.fd,
+                connection.payload.data() + connection.payload_received,
+                connection.payload.size() - connection.payload_received, 0);
+            if (count > 0) {
+                connection.payload_received += static_cast<std::size_t>(count);
+            } else if (count == 0) {
+                return false;
+            } else if (errno == EINTR) {
                 continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return !peer_closed;
+            } else {
+                return false;
             }
+        }
+
+        if (!node_table_.recordContact(connection.header.sender,
+                                       connection.peer_ipv4)) {
             return false;
         }
 
-        MsgHeader header{};
-        std::memcpy(&header, connection.bytes.data(), sizeof(header));
-        header.seq = ntohl(header.seq);
-        header.page = ntohl(header.page);
-        header.payload_len = ntohl(header.payload_len);
-        if (header.type == static_cast<std::uint8_t>(MessageType::Heartbeat) &&
-            header.status == 0 && header.flags == 0 &&
-            header.page == PAGE_NONE && header.payload_len == 0) {
-            node_table_.recordHeartbeat(header.sender, connection.peer_ipv4);
+        if (connection.header.type == DEMO_MESSAGE) {
+            const std::string message(connection.payload.begin(),
+                                      connection.payload.end());
+            const char* channel_name =
+                connection.channel == Channel::Data ? "data" : "control";
+            const char* delivery =
+                connection.header.flags == DEMO_BROADCAST ? "broadcast" : "direct";
+            std::lock_guard<std::mutex> lock(console_output_mutex);
+            std::cout << "\nReceived " << delivery << " from node "
+                      << static_cast<unsigned int>(connection.header.sender)
+                      << " on " << channel_name << ": " << message << '\n'
+                      << "Comandos: nodes | broadcast <data|control> <mensaje> | "
+                         "send <node_id> <data|control> <mensaje> | quit\n"
+                      << std::flush;
         }
         return false;
     }
 
-    bool sendHeartbeat(std::uint8_t target_id) const {
+    bool sendFrame(std::uint8_t target_id, Channel channel, MsgHeader header,
+                   const std::uint8_t* payload, std::size_t payload_size) const {
         const int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0 || !setNonBlocking(fd)) {
             if (fd >= 0) {
@@ -653,9 +841,10 @@ private:
             return false;
         }
 
-        const int connect_result = connect(
-            fd, reinterpret_cast<const sockaddr*>(&peer_addresses_[target_id]),
-            sizeof(peer_addresses_[target_id]));
+        sockaddr_in destination = peer_addresses_[target_id];
+        destination.sin_port = htons(channelPort(config_, target_id, channel));
+        const int connect_result = connect(fd,
+            reinterpret_cast<const sockaddr*>(&destination), sizeof(destination));
         if (connect_result < 0 && errno != EINPROGRESS) {
             close(fd);
             return false;
@@ -676,12 +865,15 @@ private:
             }
         }
 
-        MsgHeader header{};
-        header.type = static_cast<std::uint8_t>(MessageType::Heartbeat);
         header.sender = node_id_;
-        header.page = htonl(PAGE_NONE);
-        std::array<std::uint8_t, MESSAGE_HEADER_SIZE> bytes{};
+        header.seq = htonl(header.seq);
+        header.page = htonl(header.page);
+        header.payload_len = htonl(static_cast<std::uint32_t>(payload_size));
+        std::vector<std::uint8_t> bytes(sizeof(header) + payload_size);
         std::memcpy(bytes.data(), &header, sizeof(header));
+        if (payload_size > 0) {
+            std::memcpy(bytes.data() + sizeof(header), payload, payload_size);
+        }
 
         std::size_t sent = 0;
         while (sent < bytes.size()) {
@@ -707,6 +899,13 @@ private:
 
         close(fd);
         return true;
+    }
+
+    bool sendHeartbeat(std::uint8_t target_id) const {
+        MsgHeader header{};
+        header.type = HEARTBEAT_MESSAGE;
+        header.page = PAGE_NONE;
+        return sendFrame(target_id, Channel::Heartbeat, header, nullptr, 0);
     }
 
     void heartbeatLoop() {
@@ -755,7 +954,8 @@ private:
     std::vector<PageEntry> page_table_;
     std::array<sockaddr_in, MAX_NODES> peer_addresses_{};
     std::atomic<bool> running_{false};
-    int heartbeat_listener_ = -1;
+    std::array<int, CHANNEL_COUNT> listeners_{{-1, -1, -1}};
+    mutable std::atomic<std::uint32_t> next_sequence_{1};
 
     std::thread network_thread_;
     std::thread heartbeat_thread_;
@@ -771,7 +971,7 @@ void printNodes(const Node& node, std::mutex& output_mutex) {
     const Config& config = node.config();
     std::lock_guard<std::mutex> lock(output_mutex);
     std::cout << "\nNodos configurados (" << entries.size() << "):\n"
-              << "ID  Estado   Host                 Puerto heartbeat\n";
+              << "ID  Estado   Host                 Datos  Control  Heartbeat\n";
     for (const auto& entry : entries) {
         const char* state =
             entry.state == static_cast<std::uint8_t>(NodeState::Online)
@@ -780,9 +980,13 @@ void printNodes(const Node& node, std::mutex& output_mutex) {
         std::cout << static_cast<unsigned int>(entry.node_id) << "   "
                   << state << "  "
                   << config.hosts[entry.node_id] << "  "
-                  << heartbeatPort(config, entry.node_id) << '\n';
+                  << channelPort(config, entry.node_id, Channel::Data) << "  "
+                  << channelPort(config, entry.node_id, Channel::Control) << "  "
+                  << channelPort(config, entry.node_id, Channel::Heartbeat) << '\n';
     }
-    std::cout << "Comandos: nodes | quit\n" << std::flush;
+    std::cout << "Comandos: nodes | broadcast <data|control> <mensaje> | "
+                 "send <node_id> <data|control> <mensaje> | quit\n"
+              << std::flush;
 }
 
 std::uint8_t parseNodeId(const std::string& value) {
@@ -791,6 +995,80 @@ std::uint8_t parseNodeId(const std::string& value) {
         throw std::runtime_error("node_id debe estar entre 0 y 31");
     }
     return static_cast<std::uint8_t>(node_id);
+}
+
+bool handleDemoCommand(const Node& node, const std::string& command) {
+    std::istringstream input(command);
+    std::string operation;
+    input >> operation;
+    if (operation != "broadcast" && operation != "send") {
+        return false;
+    }
+
+    std::optional<std::uint8_t> target;
+    if (operation == "send") {
+        std::string target_text;
+        if (!(input >> target_text)) {
+            std::lock_guard<std::mutex> lock(console_output_mutex);
+            std::cout << "Uso: send <node_id> <data|control> <mensaje>\n";
+            return true;
+        }
+        try {
+            target = parseNodeId(target_text);
+        } catch (const std::exception& error) {
+            std::lock_guard<std::mutex> lock(console_output_mutex);
+            std::cout << "Destino inválido: " << error.what() << '\n';
+            return true;
+        }
+    }
+
+    std::string channel_text;
+    if (!(input >> channel_text)) {
+        std::lock_guard<std::mutex> lock(console_output_mutex);
+        std::cout << "Falta el canal: use data o control.\n";
+        return true;
+    }
+
+    Channel channel;
+    if (channel_text == "data") {
+        channel = Channel::Data;
+    } else if (channel_text == "control") {
+        channel = Channel::Control;
+    } else {
+        std::lock_guard<std::mutex> lock(console_output_mutex);
+        std::cout << "Canal inválido: use data o control.\n";
+        return true;
+    }
+
+    std::string message;
+    std::getline(input, message);
+    message = trim(message);
+    if (message.empty()) {
+        std::lock_guard<std::mutex> lock(console_output_mutex);
+        std::cout << "El mensaje no puede estar vacío.\n";
+        return true;
+    }
+    if (message.size() > DEMO_MAX_BYTES) {
+        std::lock_guard<std::mutex> lock(console_output_mutex);
+        std::cout << "El mensaje supera el límite de "
+                  << DEMO_MAX_BYTES << " bytes.\n";
+        return true;
+    }
+
+    if (node.sendDemoMessage(target, channel, message)) {
+        std::lock_guard<std::mutex> lock(console_output_mutex);
+        std::cout << "Mensaje enviado por " << channel_text
+                  << (target ? " al nodo " +
+                                   std::to_string(static_cast<unsigned int>(*target))
+                             : " a los demás nodos")
+                  << ".\n" << std::flush;
+    } else {
+        std::lock_guard<std::mutex> lock(console_output_mutex);
+        std::cout << "No se pudo enviar el mensaje. Verifique el destino, "
+                     "que haya pares configurados y que el puerto esté accesible.\n"
+                  << std::flush;
+    }
+    return true;
 }
 
 } // namespace dsm
@@ -995,7 +1273,6 @@ int main(int argc, char* argv[]) {
         dsm::Node node(config, node_id);
         node.start();
 
-        std::mutex output_mutex;
         std::atomic<bool> monitor_running{true};
         std::thread monitor([&] {
             auto previous = node.nodes();
@@ -1007,13 +1284,13 @@ int main(int argc, char* argv[]) {
                     changed = current[id].state != previous[id].state;
                 }
                 if (changed) {
-                    dsm::printNodes(node, output_mutex);
+                    dsm::printNodes(node, dsm::console_output_mutex);
                     previous = current;
                 }
             }
         });
 
-        dsm::printNodes(node, output_mutex);
+        dsm::printNodes(node, dsm::console_output_mutex);
         std::string command;
         while (std::getline(std::cin, command)) {
             command = dsm::trim(command);
@@ -1021,10 +1298,15 @@ int main(int argc, char* argv[]) {
                 break;
             }
             if (command == "nodes") {
-                dsm::printNodes(node, output_mutex);
+                dsm::printNodes(node, dsm::console_output_mutex);
+            } else if (dsm::handleDemoCommand(node, command)) {
+                continue;
             } else if (!command.empty()) {
-                std::lock_guard<std::mutex> lock(output_mutex);
-                std::cout << "Comando desconocido. Use: nodes | quit\n" << std::flush;
+                std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
+                std::cout << "Comando desconocido. Use: nodes | broadcast "
+                             "<data|control> <mensaje> | send <node_id> "
+                             "<data|control> <mensaje> | quit\n"
+                          << std::flush;
             }
         }
 
