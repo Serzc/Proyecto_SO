@@ -258,6 +258,17 @@ public:
         return true;
     }
 
+    bool recordHeartbeat(std::uint8_t node_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (node_id >= node_count_ || node_id == local_node_id_) {
+            return false;
+        }
+
+        entries_[node_id].state = static_cast<std::uint8_t>(NodeState::Online);
+        last_seen_[node_id] = Clock::now();
+        return true;
+    }
+
     void markTimedOut(std::chrono::milliseconds timeout) {
         const auto now = Clock::now();
         std::lock_guard<std::mutex> lock(mutex_);
@@ -808,8 +819,12 @@ private:
             }
         }
 
-        if (!node_table_.recordContact(connection.header.sender,
-                                       connection.peer_ipv4)) {
+        const bool valid_peer =
+            connection.header.type == HEARTBEAT_MESSAGE
+                ? node_table_.recordHeartbeat(connection.header.sender)
+                : node_table_.recordContact(connection.header.sender,
+                                            connection.peer_ipv4);
+        if (!valid_peer) {
             return false;
         }
 
