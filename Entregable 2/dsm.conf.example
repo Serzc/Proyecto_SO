@@ -1,0 +1,12 @@
+# Copy this file on every machine and use the same host order everywhere.
+# Replace these example addresses with each machine's reachable IPv4 address.
+page_size = 4096
+pages_per_node = 256
+heartbeat_ms = 1000
+timeout_ms = 5000
+port_base = 28400
+dsm_base = 0x100000000000
+
+# The position in this list is the node_id.
+host = 192.168.1.10
+host = 192.168.1.11
