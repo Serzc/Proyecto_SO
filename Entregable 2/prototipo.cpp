@@ -48,10 +48,8 @@ constexpr std::size_t DEMO_MAX_BYTES = 1024;
 constexpr std::size_t CHANNEL_COUNT = 3;
 std::mutex console_output_mutex;
 
-// Demo-only message type; this does not add a DSM operation to section 5.
+// Demo-only message type not a DSM operation
 // Each broadcast is sent as one unicast TCP frame to every configured peer.
-// MSI access policy below models the section 2.4 transitions; data messages
-// do not perform page transfers or change page-table states.
 enum class Channel : std::uint8_t {
     Data = 0,
     Control = 1,
@@ -246,19 +244,7 @@ public:
         last_seen_[local_node_id_] = Clock::now();
     }
 
-    bool recordContact(std::uint8_t node_id, std::uint32_t source_ipv4) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (node_id >= node_count_ || node_id == local_node_id_ ||
-            entries_[node_id].ipv4 != source_ipv4) {
-            return false;
-        }
-
-        entries_[node_id].state = static_cast<std::uint8_t>(NodeState::Online);
-        last_seen_[node_id] = Clock::now();
-        return true;
-    }
-
-    bool recordHeartbeat(std::uint8_t node_id) {
+    bool recordPeerMessage(std::uint8_t node_id) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (node_id >= node_count_ || node_id == local_node_id_) {
             return false;
@@ -615,7 +601,6 @@ private:
         MsgHeader header{};
         std::vector<std::uint8_t> payload;
         std::size_t payload_received = 0;
-        std::uint32_t peer_ipv4 = 0;
     };
 
     int openListener(Channel channel) const {
@@ -718,11 +703,8 @@ private:
             if (connections.size() >= MAX_NODES * CHANNEL_COUNT) {
                 return;
             }
-            sockaddr_in peer_address{};
-            socklen_t address_length = sizeof(peer_address);
             const int fd = accept(listeners_[static_cast<std::size_t>(channel)],
-                                  reinterpret_cast<sockaddr*>(&peer_address),
-                                  &address_length);
+                                  nullptr, nullptr);
             if (fd < 0) {
                 if (errno == EINTR) {
                     continue;
@@ -741,7 +723,6 @@ private:
             Connection connection{};
             connection.fd = fd;
             connection.channel = channel;
-            connection.peer_ipv4 = peer_address.sin_addr.s_addr;
             connections.push_back(std::move(connection));
         }
     }
@@ -819,12 +800,7 @@ private:
             }
         }
 
-        const bool valid_peer =
-            connection.header.type == HEARTBEAT_MESSAGE
-                ? node_table_.recordHeartbeat(connection.header.sender)
-                : node_table_.recordContact(connection.header.sender,
-                                            connection.peer_ipv4);
-        if (!valid_peer) {
+        if (!node_table_.recordPeerMessage(connection.header.sender)) {
             return false;
         }
 
