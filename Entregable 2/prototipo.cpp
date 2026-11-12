@@ -26,6 +26,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+//g++ -std=c++17 -pthread -Wall -Wextra -Wpedantic "Entregable 2/prototipo.cpp" -o dsmnode
+
 namespace dsm {
 
 constexpr std::size_t MAX_NODES = 32;
