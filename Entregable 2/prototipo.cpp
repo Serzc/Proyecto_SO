@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <functional>
+#include <ifaddrs.h>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -417,6 +418,31 @@ std::uint32_t resolveIPv4(const char* host) {
     return ipv4;
 }
 
+bool isLocalIPv4(std::uint32_t ipv4) {
+    ifaddrs* interfaces = nullptr;
+    if (getifaddrs(&interfaces) < 0) {
+        throw std::runtime_error("getifaddrs() falló al validar la IP local: " +
+                                 std::string(std::strerror(errno)));
+    }
+
+    bool found = false;
+    for (const ifaddrs* interface = interfaces; interface != nullptr;
+         interface = interface->ifa_next) {
+        if (interface->ifa_addr == nullptr ||
+            interface->ifa_addr->sa_family != AF_INET) {
+            continue;
+        }
+        const auto* address =
+            reinterpret_cast<const sockaddr_in*>(interface->ifa_addr);
+        if (address->sin_addr.s_addr == ipv4) {
+            found = true;
+            break;
+        }
+    }
+    freeifaddrs(interfaces);
+    return found;
+}
+
 std::uint16_t heartbeatPort(const Config& config, std::uint8_t node_id) {
     return static_cast<std::uint16_t>(
         config.port_base + 3U * static_cast<std::uint16_t>(node_id) +
@@ -446,6 +472,19 @@ public:
             peer_addresses_[id].sin_port =
                 htons(channelPort(config_, peer_id, Channel::Heartbeat));
             node_table_.configureNode(peer_id, peer_addresses_[id].sin_addr.s_addr);
+        }
+
+        if (!isLocalIPv4(peer_addresses_[node_id_].sin_addr.s_addr)) {
+            char address_text[INET_ADDRSTRLEN]{};
+            const char* configured_ip = inet_ntop(
+                AF_INET, &peer_addresses_[node_id_].sin_addr,
+                address_text, sizeof(address_text));
+            throw std::invalid_argument(
+                "node_id " + std::to_string(static_cast<unsigned int>(node_id_)) +
+                " configura host '" + config_.hosts[node_id_] + "' (" +
+                (configured_ip == nullptr ? std::string("IP no disponible")
+                                          : std::string(configured_ip)) +
+                "), pero esa IPv4 no está asignada a esta máquina");
         }
 
         const std::uint32_t total_pages =
