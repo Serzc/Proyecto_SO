@@ -27,8 +27,12 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <csignal>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 // g++ -std=c++17 -pthread -Wall -Wextra -Wpedantic "Entregable 3/prototipo_2.cpp" -o dsmnode
@@ -360,6 +364,28 @@ public:
         stats_[node_id].free_pages += count;
     }
 
+    // Cuenta un fallo atendido y mueve la página entre los contadores M/S/I.
+    void recordPageState(std::uint8_t node_id, PageState from, PageState to,
+                         bool fault) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (node_id >= node_count_) {
+            throw std::logic_error("Nodo fuera de rango en estadísticas MSI");
+        }
+        NodeStats& stats = stats_[node_id];
+        const auto counter = [&stats](PageState state) -> std::uint32_t& {
+            return state == PageState::Modified ? stats.pages_m
+                 : state == PageState::Shared   ? stats.pages_s
+                                                : stats.pages_i;
+        };
+        if (from != to) {
+            --counter(from);
+            ++counter(to);
+        }
+        if (fault) {
+            ++stats.faults;
+        }
+    }
+
 private:
     const std::size_t node_count_;
     const std::uint8_t local_node_id_;
@@ -538,6 +564,75 @@ std::uint16_t channelPort(const Config& config, std::uint8_t node_id,
         static_cast<std::uint8_t>(channel));
 }
 
+// Estado global que lee el manejador de SIGSEGV. Solo hay una región DSM por
+// proceso, porque un proceso solo puede tener un manejador de SIGSEGV.
+namespace pager {
+
+struct FaultMsg {
+    std::uint32_t page;
+    std::uint32_t write;
+};
+
+std::atomic<std::uintptr_t> region_base{0};
+std::atomic<std::size_t> region_bytes{0};
+std::atomic<std::size_t> page_bytes{0};
+std::atomic<int> fault_fd{-1};
+// Por página: el worker incrementa la generación al terminar cada solicitud.
+std::atomic<std::uint32_t>* generations = nullptr;
+std::atomic<std::uint8_t>* failed = nullptr;
+struct sigaction previous_action {};
+
+void restorePreviousHandler() {
+    sigaction(SIGSEGV, &previous_action, nullptr);
+}
+
+// Solo usa operaciones async-signal-safe: atómicos lock-free, write y nanosleep.
+void onSegv(int, siginfo_t* info, void* context) {
+    const auto address = reinterpret_cast<std::uintptr_t>(info->si_addr);
+    const std::uintptr_t base = region_base.load();
+    if (base == 0 || address < base || address - base >= region_bytes.load()) {
+        // No es memoria DSM: al reintentar la instrucción actúa el manejador previo.
+        restorePreviousHandler();
+        return;
+    }
+
+    const auto page = static_cast<std::uint32_t>((address - base) / page_bytes.load());
+    // shortcut: bit 1 de REG_ERR indica escritura solo en Linux x86_64.
+    const auto* ucontext = static_cast<const ucontext_t*>(context);
+    const bool write_access = (ucontext->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+
+    const std::uint32_t generation = generations[page].load();
+    const FaultMsg message{page, write_access ? 1U : 0U};
+    if (::write(fault_fd.load(), &message, sizeof(message)) !=
+        static_cast<ssize_t>(sizeof(message))) {
+        restorePreviousHandler();
+        return;
+    }
+    const timespec pause{0, 100000};
+    while (generations[page].load() == generation) {
+        nanosleep(&pause, nullptr);
+    }
+    if (failed[page].load() != 0) {
+        static const char text[] = "dsm: fallo de página que este nodo no puede resolver\n";
+        if (::write(STDERR_FILENO, text, sizeof(text) - 1) < 0) {
+            // Nada más que hacer dentro del manejador.
+        }
+        restorePreviousHandler();
+    }
+    // Al retornar, el CPU reintenta el acceso con la nueva protección.
+}
+
+}  // namespace pager
+
+int protectionFor(PageState state) {
+    switch (state) {
+    case PageState::Modified: return PROT_READ | PROT_WRITE;
+    case PageState::Shared: return PROT_READ;
+    case PageState::Invalid: break;
+    }
+    return PROT_NONE;
+}
+
 class Node {
 public:
     Node(Config config, std::uint8_t node_id)
@@ -592,6 +687,8 @@ public:
         }
 
         try {
+            setupMemory();
+            fault_thread_ = std::thread(&Node::faultLoop, this);
             for (std::size_t role = 0; role < CHANNEL_COUNT; ++role) {
                 listeners_[role] = openListener(static_cast<Channel>(role));
             }
@@ -618,6 +715,7 @@ public:
                     listener = -1;
                 }
             }
+            teardownMemory();
             throw;
         }
     }
@@ -642,6 +740,8 @@ public:
         }
 
         joinThreads(user_threads_, user_threads_mutex_);
+        // Las aplicaciones ya terminaron: se puede liberar la región DSM.
+        teardownMemory();
     }
 
     void launchUserThread(std::function<void()> application) {
@@ -879,6 +979,157 @@ public:
     }
 
 private:
+    // Reserva la región DSM: una vista PROT_NONE en dsm_base, la que usan las
+    // aplicaciones, y un alias RW interno sobre el mismo memfd para que el nodo
+    // pueda escribir páginas sin abrir la protección de la vista.
+    void setupMemory() {
+        if (pager::region_base.load() != 0) {
+            throw std::runtime_error("Ya existe una región DSM en este proceso");
+        }
+        const std::size_t total_pages = page_table_.size();
+        const std::size_t bytes = total_pages * config_.page_size;
+
+        memfd_ = memfd_create("dsm", MFD_CLOEXEC);
+        if (memfd_ < 0 || ftruncate(memfd_, static_cast<off_t>(bytes)) != 0) {
+            throw std::runtime_error(std::string("memfd: ") + std::strerror(errno));
+        }
+        void* const wanted = reinterpret_cast<void*>(
+            static_cast<std::uintptr_t>(config_.dsm_base));
+        void* view = mmap(wanted, bytes, PROT_NONE,
+                          MAP_SHARED | MAP_FIXED_NOREPLACE, memfd_, 0);
+        if (view == MAP_FAILED || view != wanted) {
+            if (view != MAP_FAILED) {
+                munmap(view, bytes);
+            }
+            throw std::runtime_error("No se pudo mapear la región DSM en dsm_base");
+        }
+        view_ = view;
+        region_size_ = bytes;
+        void* alias = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, memfd_, 0);
+        if (alias == MAP_FAILED) {
+            throw std::runtime_error(std::string("mmap alias: ") + std::strerror(errno));
+        }
+        alias_ = static_cast<std::uint8_t*>(alias);
+
+        if (pipe2(fault_pipe_.data(), O_CLOEXEC) != 0) {
+            throw std::runtime_error(std::string("pipe: ") + std::strerror(errno));
+        }
+        fault_generations_ = std::make_unique<std::atomic<std::uint32_t>[]>(total_pages);
+        fault_failed_ = std::make_unique<std::atomic<std::uint8_t>[]>(total_pages);
+
+        pager::generations = fault_generations_.get();
+        pager::failed = fault_failed_.get();
+        pager::page_bytes = config_.page_size;
+        pager::region_bytes = bytes;
+        pager::fault_fd = fault_pipe_[1];
+        struct sigaction action {};
+        action.sa_sigaction = pager::onSegv;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        if (sigaction(SIGSEGV, &action, &pager::previous_action) != 0) {
+            throw std::runtime_error(std::string("sigaction: ") + std::strerror(errno));
+        }
+        signal_installed_ = true;
+        pager::region_base = reinterpret_cast<std::uintptr_t>(view_);
+    }
+
+    // Seguro de llamar varias veces y con la región a medio crear.
+    void teardownMemory() {
+        if (pager::region_base.load() == reinterpret_cast<std::uintptr_t>(view_)) {
+            pager::region_base = 0;
+        }
+        if (fault_pipe_[1] >= 0) {
+            pager::fault_fd = -1;
+            close(fault_pipe_[1]);  // El worker recibe EOF y termina.
+            fault_pipe_[1] = -1;
+        }
+        if (fault_thread_.joinable()) {
+            fault_thread_.join();
+        }
+        if (signal_installed_) {
+            pager::restorePreviousHandler();
+            signal_installed_ = false;
+        }
+        if (fault_pipe_[0] >= 0) {
+            close(fault_pipe_[0]);
+            fault_pipe_[0] = -1;
+        }
+        if (alias_ != nullptr) {
+            munmap(alias_, region_size_);
+            alias_ = nullptr;
+        }
+        if (view_ != nullptr) {
+            munmap(view_, region_size_);
+            view_ = nullptr;
+        }
+        if (memfd_ >= 0) {
+            close(memfd_);
+            memfd_ = -1;
+        }
+    }
+
+    void protectPage(std::uint32_t page, PageState state) {
+        void* address = static_cast<std::uint8_t*>(view_) +
+                        static_cast<std::size_t>(page) * config_.page_size;
+        if (mprotect(address, config_.page_size, protectionFor(state)) != 0) {
+            throw std::runtime_error(std::string("mprotect: ") + std::strerror(errno));
+        }
+    }
+
+    // Un solo hilo atiende los fallos, así cada página se recupera una vez a la vez.
+    void faultLoop() {
+        pager::FaultMsg message{};
+        while (true) {
+            const ssize_t got = read(fault_pipe_[0], &message, sizeof(message));
+            if (got == 0) {
+                return;
+            }
+            if (got != static_cast<ssize_t>(sizeof(message))) {
+                if (got < 0 && errno == EINTR) {
+                    continue;
+                }
+                return;
+            }
+            if (message.page >= page_table_.size()) {
+                continue;
+            }
+            bool resolved = false;
+            try {
+                resolved = resolveFault(message.page, message.write != 0);
+            } catch (const std::exception& error) {
+                std::lock_guard<std::mutex> lock(console_output_mutex);
+                std::cerr << "dsm: " << error.what() << '\n';
+            }
+            fault_failed_[message.page] = resolved ? 0 : 1;
+            fault_generations_[message.page].fetch_add(1);
+        }
+    }
+
+    bool resolveFault(std::uint32_t page, bool write_access) {
+        const std::uint32_t local_start =
+            static_cast<std::uint32_t>(node_id_) * config_.pages_per_node;
+        std::lock_guard<std::mutex> lock(page_table_mutex_);
+        PageEntry& entry = page_table_[page];
+        const bool local_page = page >= local_start &&
+                                page - local_start < config_.pages_per_node &&
+                                entry.proc_id != 0;
+        if (!local_page) {
+            // shortcut: páginas remotas o sin asignar fallan; PAGE_REQUEST llega en el día 3.
+            return false;
+        }
+        const auto current = static_cast<PageState>(entry.state);
+        const MsiAccessPolicy policy = msiPolicyForAccess(
+            current, write_access ? PageAccess::Write : PageAccess::Read);
+        // El nodo es home y la única copia, así que no hay que pedir ni invalidar.
+        // Si policy.retry_access, el reintento de la escritura sube S -> M.
+        if (policy.granted_state != current) {
+            protectPage(page, policy.granted_state);
+            entry.state = static_cast<std::uint8_t>(policy.granted_state);
+        }
+        node_table_.recordPageState(node_id_, current, policy.granted_state, true);
+        return true;
+    }
+
     struct Connection {
         int fd;
         Channel channel;
@@ -1259,6 +1510,16 @@ private:
             }
         }
         for (std::uint32_t offset = 0; offset < count; ++offset) {
+            const auto state =
+                static_cast<PageState>(page_table_[first_page + offset].state);
+            if (view_ != nullptr) {
+                protectPage(first_page + offset, PageState::Invalid);
+                // Una página reutilizada no debe exponer datos del proceso anterior.
+                std::memset(alias_ + static_cast<std::size_t>(first_page + offset) *
+                                         config_.page_size,
+                            0, config_.page_size);
+            }
+            node_table_.recordPageState(node_id_, state, PageState::Invalid, false);
             page_table_[first_page + offset] = PageEntry{};
             page_table_[first_page + offset].state =
                 static_cast<std::uint8_t>(PageState::Invalid);
@@ -1578,6 +1839,17 @@ private:
     std::unordered_map<std::uintptr_t, Allocation> allocations_;
     std::unordered_map<std::uint32_t, Allocation> home_allocations_;
     std::atomic<std::size_t> allocation_cursor_{0};
+
+    // Región DSM local (ver setupMemory).
+    int memfd_ = -1;
+    void* view_ = nullptr;
+    std::uint8_t* alias_ = nullptr;
+    std::size_t region_size_ = 0;
+    std::array<int, 2> fault_pipe_{{-1, -1}};
+    std::thread fault_thread_;
+    bool signal_installed_ = false;
+    std::unique_ptr<std::atomic<std::uint32_t>[]> fault_generations_;
+    std::unique_ptr<std::atomic<std::uint8_t>[]> fault_failed_;
 };
 
 void printNodes(const Node& node, std::mutex& output_mutex) {
