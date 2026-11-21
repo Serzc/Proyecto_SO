@@ -54,6 +54,16 @@ int main(int argc, char* argv[]) {
         shared[1] = 1;
 
         waitFor(2, 1);             // Su copia fue invalidada y vuelve a pedirla.
+
+        // Consultas remotas (QUERY_REQUEST) al home.
+        dsm_stats_t home{};
+        assert(dsm_stats(0, &home) == DSM_OK);
+        assert(home.total_pages == 16 && home.free_pages == 14);
+        dsm_page_t pages[2]{};
+        assert(dsm_page_table(0, 0, 2, pages) == 2);
+        assert(pages[0].proc_id == 7 && pages[1].proc_id == 7 && pages[1].order == 1);
+        assert(pages[0].owner == 0);
+        assert(dsm_page_table(0, 15, 2, pages) == DSM_E_INVAL);  // Fuera del rango del nodo 0.
         shared[3] = 1;
         dsm_stats_t stats{};
         assert(dsm_stats(1, &stats) == DSM_OK);

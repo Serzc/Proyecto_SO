@@ -59,6 +59,11 @@ constexpr std::uint8_t STATUS_OK = 0;
 constexpr std::uint8_t STATUS_NO_SPACE = 1;
 constexpr std::uint8_t STATUS_INVALID = 2;
 constexpr std::size_t CHANNEL_COUNT = 3;
+constexpr std::uint32_t QUERY_STATS = 0;
+constexpr std::uint32_t QUERY_PAGES = 1;
+constexpr std::size_t QUERY_REQUEST_SIZE = 12;
+constexpr std::size_t QUERY_STATS_SIZE = 32;
+constexpr std::size_t QUERY_PAGE_ENTRY_SIZE = 16;
 constexpr std::uint8_t REQUEST_NONE = 0;
 constexpr std::uint8_t REQUEST_ACTIVE = 1;
 constexpr std::uint8_t REQUEST_INVALIDATED = 2;
@@ -753,6 +758,56 @@ public:
         return node_table_.statsSnapshot();
     }
 
+    // Estadísticas de cualquier nodo: las locales se leen directo, las remotas
+    // con QUERY_REQUEST.
+    int queryStats(std::uint8_t target, NodeStats& out) {
+        if (target == node_id_) {
+            out = stats()[node_id_];
+            return DSM_OK;
+        }
+        std::vector<std::uint8_t> reply;
+        const int result = remoteQuery(target, QUERY_STATS, 0, 0, reply);
+        if (result != DSM_OK) {
+            return result;
+        }
+        std::uint32_t* fields[] = {&out.total_pages, &out.free_pages, &out.pages_m,
+                                   &out.pages_s, &out.pages_i, &out.faults,
+                                   &out.pages_sent, &out.pages_recv};
+        for (std::size_t index = 0; index < 8; ++index) {
+            if (!readU32(reply, index * 4, *fields[index])) {
+                return DSM_E_NET;
+            }
+        }
+        return DSM_OK;
+    }
+
+    int queryPageTable(std::uint8_t target, std::uint32_t first_page,
+                       std::uint32_t count, std::vector<PageEntry>& out) {
+        out.assign(count, PageEntry{});
+        if (target == node_id_) {
+            return copyPageTable(target, first_page, count, out.data()) ? DSM_OK
+                                                                        : DSM_E_INVAL;
+        }
+        std::vector<std::uint8_t> reply;
+        const int result = remoteQuery(target, QUERY_PAGES, first_page, count, reply);
+        if (result != DSM_OK) {
+            return result;
+        }
+        if (reply.size() != count * QUERY_PAGE_ENTRY_SIZE) {
+            return DSM_E_NET;
+        }
+        for (std::uint32_t index = 0; index < count; ++index) {
+            const std::size_t at = index * QUERY_PAGE_ENTRY_SIZE;
+            PageEntry& entry = out[index];
+            readU32(reply, at, entry.proc_id);
+            readU32(reply, at + 4, entry.copyset);
+            readU32(reply, at + 8, entry.order);
+            entry.state = reply[at + 12];
+            entry.owner = reply[at + 13];
+        }
+        return DSM_OK;
+    }
+
     bool copyPageTable(std::uint8_t target_node, std::uint32_t first_page,
                        std::uint32_t count, PageEntry* out) const {
         const auto node_entries = nodes();
@@ -1239,6 +1294,55 @@ private:
         }
     }
 
+    int remoteQuery(std::uint8_t target, std::uint32_t kind, std::uint32_t first_page,
+                    std::uint32_t count, std::vector<std::uint8_t>& reply) {
+        std::vector<std::uint8_t> request;
+        appendU32(request, kind);
+        appendU32(request, first_page);
+        appendU32(request, count);
+        return requestMessage(target, MessageType::QueryRequest, PAGE_NONE, request,
+                              MessageType::QueryReply, reply);
+    }
+
+    // Hilo de red: solo copia datos locales, no espera a otros nodos.
+    void handleQuery(const MsgHeader& request, const std::vector<std::uint8_t>& payload) {
+        std::uint32_t kind = 0;
+        std::uint32_t first_page = 0;
+        std::uint32_t count = 0;
+        std::vector<std::uint8_t> data;
+        bool valid = readU32(payload, 0, kind) && readU32(payload, 4, first_page) &&
+                     readU32(payload, 8, count);
+        if (valid && kind == QUERY_STATS) {
+            const NodeStats own = stats()[node_id_];
+            for (const std::uint32_t value :
+                 {own.total_pages, own.free_pages, own.pages_m, own.pages_s,
+                  own.pages_i, own.faults, own.pages_sent, own.pages_recv}) {
+                appendU32(data, value);
+            }
+        } else if (valid && kind == QUERY_PAGES && count > 0 && count <= QUERY_MAX) {
+            std::vector<PageEntry> pages(count);
+            valid = copyPageTable(node_id_, first_page, count, pages.data());
+            for (const PageEntry& entry : pages) {
+                appendU32(data, entry.proc_id);
+                appendU32(data, entry.copyset);
+                appendU32(data, entry.order);
+                data.push_back(entry.state);
+                data.push_back(entry.owner);
+                data.push_back(0);
+                data.push_back(0);
+            }
+        } else {
+            valid = false;
+        }
+        MsgHeader reply{};
+        reply.type = static_cast<std::uint8_t>(MessageType::QueryReply);
+        reply.status = valid ? STATUS_OK : STATUS_INVALID;
+        reply.seq = request.seq;
+        reply.page = PAGE_NONE;
+        sendFrame(request.sender, Channel::Control, reply,
+                  valid ? data.data() : nullptr, valid ? data.size() : 0);
+    }
+
     // Hilo de red: responde de inmediato, sin esperar a otros nodos.
     void handleInvalidate(const MsgHeader& request) {
         std::vector<std::uint8_t> data;
@@ -1565,6 +1669,17 @@ private:
             return header.seq != 0 && header.page == PAGE_NONE &&
                    header.payload_len == 0 &&
                    header.status <= STATUS_INVALID;
+        case MessageType::QueryRequest:
+            return header.seq != 0 && header.status == STATUS_OK &&
+                   header.page == PAGE_NONE &&
+                   header.payload_len == QUERY_REQUEST_SIZE;
+        case MessageType::QueryReply:
+            return header.seq != 0 && header.page == PAGE_NONE &&
+                   ((header.status == STATUS_OK &&
+                     (header.payload_len == QUERY_STATS_SIZE ||
+                      (header.payload_len % QUERY_PAGE_ENTRY_SIZE == 0 &&
+                       header.payload_len <= QUERY_MAX * QUERY_PAGE_ENTRY_SIZE))) ||
+                    (header.status == STATUS_INVALID && header.payload_len == 0));
         case MessageType::PageRequest:
             return header.seq != 0 && header.status == STATUS_OK &&
                    header.page < page_table_.size() &&
@@ -1628,7 +1743,11 @@ private:
         case MessageType::FreeReply:
         case MessageType::PageData:
         case MessageType::InvalidateAck:
+        case MessageType::QueryReply:
             completePending(header, std::move(connection.payload));
+            break;
+        case MessageType::QueryRequest:
+            handleQuery(header, connection.payload);
             break;
         case MessageType::AllocRequest:
             handleAllocRequest(header, connection.payload);
@@ -1835,6 +1954,8 @@ private:
                 : response.type == static_cast<std::uint8_t>(MessageType::FreeReply) ||
                           response.type == static_cast<std::uint8_t>(MessageType::PageData)
                     ? DSM_E_BADADDR
+                : response.type == static_cast<std::uint8_t>(MessageType::QueryReply)
+                    ? DSM_E_INVAL
                     : DSM_E_NET;
         pending->complete = true;
         pending->ready.notify_one();
@@ -2326,15 +2447,18 @@ extern "C" int dsm_stats(int node_id, dsm_stats_t* out) {
     if (static_cast<std::size_t>(node_id) >= nodes.size()) {
         return DSM_E_INVAL;
     }
-    if (node_id != api_node->nodeId()) {
-        return nodes[static_cast<std::size_t>(node_id)].state ==
-                       static_cast<std::uint8_t>(dsm::NodeState::Online)
-                   ? DSM_E_NOT_IMPLEMENTED
-                   : DSM_E_NODE_DOWN;
+    if (node_id != api_node->nodeId() &&
+        nodes[static_cast<std::size_t>(node_id)].state !=
+            static_cast<std::uint8_t>(dsm::NodeState::Online)) {
+        return DSM_E_NODE_DOWN;
     }
 
-    const auto stats = api_node->stats();
-    const auto& source = stats[static_cast<std::size_t>(node_id)];
+    dsm::NodeStats source{};
+    const int result =
+        api_node->queryStats(static_cast<std::uint8_t>(node_id), source);
+    if (result != DSM_OK) {
+        return result;
+    }
     *out = {source.total_pages, source.free_pages, source.pages_m, source.pages_s,
             source.pages_i, source.faults, source.pages_sent, source.pages_recv};
     return DSM_OK;
@@ -2356,17 +2480,17 @@ extern "C" int dsm_page_table(int node_id, uint32_t first_page, uint32_t count,
     if (static_cast<std::size_t>(node_id) >= nodes.size()) {
         return DSM_E_INVAL;
     }
-    if (node_id != api_node->nodeId()) {
-        return nodes[static_cast<std::size_t>(node_id)].state ==
-                       static_cast<std::uint8_t>(dsm::NodeState::Online)
-                   ? DSM_E_NOT_IMPLEMENTED
-                   : DSM_E_NODE_DOWN;
+    if (node_id != api_node->nodeId() &&
+        nodes[static_cast<std::size_t>(node_id)].state !=
+            static_cast<std::uint8_t>(dsm::NodeState::Online)) {
+        return DSM_E_NODE_DOWN;
     }
 
-    std::vector<dsm::PageEntry> pages(count);
-    if (!api_node->copyPageTable(static_cast<std::uint8_t>(node_id), first_page,
-                                 count, pages.data())) {
-        return DSM_E_INVAL;
+    std::vector<dsm::PageEntry> pages;
+    const int result = api_node->queryPageTable(static_cast<std::uint8_t>(node_id),
+                                                first_page, count, pages);
+    if (result != DSM_OK) {
+        return result;
     }
     for (std::size_t index = 0; index < count; ++index) {
         const auto& source = pages[index];
