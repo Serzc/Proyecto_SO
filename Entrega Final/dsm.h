@@ -60,9 +60,12 @@ int dsm_stats(int node_id, dsm_stats_t* out);
 int dsm_page_table(int node_id, uint32_t first_page, uint32_t count,
                    dsm_page_t* out);
 size_t dsm_page_size(void);
+/* Dirección de una página global del DSM (NULL si no existe). Junto con
+   dsm_page_table permite ubicar la asignación de otro proceso. */
+void* dsm_page_address(uint32_t page);
 const char* dsm_strerror(int err);
 
-/* Define DSM_NO_MAIN when compiling prototipo.cpp as a library object. */
+/* Define DSM_NO_MAIN when compiling dsm.cpp as a library object. */
 #ifdef __cplusplus
 }
 #endif

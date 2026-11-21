@@ -2614,6 +2614,19 @@ extern "C" size_t dsm_page_size(void) {
     return api_node ? api_node->config().page_size : 0;
 }
 
+extern "C" void* dsm_page_address(uint32_t page) {
+    std::lock_guard<std::mutex> lock(api_mutex);
+    if (!api_node) {
+        return nullptr;
+    }
+    const dsm::Config& config = api_node->config();
+    if (page >= static_cast<std::uint32_t>(config.num_hosts) * config.pages_per_node) {
+        return nullptr;
+    }
+    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(
+        config.dsm_base + static_cast<std::uint64_t>(page) * config.page_size));
+}
+
 extern "C" const char* dsm_strerror(int err) {
     switch (err) {
     case DSM_OK: return "Success";
