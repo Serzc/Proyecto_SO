@@ -1,0 +1,16 @@
+sequenceDiagram
+  participant A as App en nodo 1
+  participant F as Hilo de fallos (nodo 1)
+  participant H as Home (nodo 0)
+  participant C as Nodo 2 (copia en M)
+  A->>A: escritura en página I, SIGSEGV
+  A->>F: pipe {página, escritura}
+  F->>H: PAGE_REQUEST (escritura)
+  H->>C: INVALIDATE
+  C->>C: mprotect PROT_NONE
+  C-->>H: INVALIDATE_ACK + página (write-back)
+  H->>H: copyset = {1}, dueño = 1
+  H-->>F: PAGE_DATA + página
+  F->>F: memcpy al alias, mprotect RW, estado M
+  F-->>A: contador de la página cambia
+  A->>A: reintenta la escritura

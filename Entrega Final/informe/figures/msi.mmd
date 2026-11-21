@@ -1,0 +1,10 @@
+stateDiagram-v2
+  direction LR
+  [*] --> I: dsm_alloc
+  I --> S: lectura (fallo, PAGE_DATA de solo lectura)
+  I --> M: escritura (fallo, el home invalida las otras copias)
+  S --> M: escritura (fallo, el home invalida las otras copias)
+  M --> S: el home recibe una lectura de otro nodo (solo el home baja a S)
+  M --> I: INVALIDATE (la página vuelve al home con write-back)
+  S --> I: INVALIDATE
+  I --> [*]: dsm_free
