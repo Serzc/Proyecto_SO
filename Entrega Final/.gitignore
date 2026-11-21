@@ -1,0 +1,8 @@
+*.o
+apps/*.o
+libdsm.a
+dsmnode
+wordcount
+matmul
+test_memoria
+test_coherencia

@@ -1,5 +1,5 @@
 // Prueba del día 2: mmap, mprotect y fallos de página en un nodo local.
-// Compilar: g++ -std=c++17 -pthread -DDSM_NO_MAIN test_memoria.cpp dsm.cpp -o test_memoria
+// Compilar y ejecutar: make test
 #include "dsm.h"
 #include <cassert>
 #include <cstdio>

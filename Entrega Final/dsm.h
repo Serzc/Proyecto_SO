@@ -65,7 +65,6 @@ size_t dsm_page_size(void);
 void* dsm_page_address(uint32_t page);
 const char* dsm_strerror(int err);
 
-/* Define DSM_NO_MAIN when compiling dsm.cpp as a library object. */
 #ifdef __cplusplus
 }
 #endif
