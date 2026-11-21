@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <condition_variable>
 #include <fcntl.h>
 #include <fstream>
@@ -58,6 +59,13 @@ constexpr std::uint8_t STATUS_OK = 0;
 constexpr std::uint8_t STATUS_NO_SPACE = 1;
 constexpr std::uint8_t STATUS_INVALID = 2;
 constexpr std::size_t CHANNEL_COUNT = 3;
+constexpr std::uint8_t REQUEST_NONE = 0;
+constexpr std::uint8_t REQUEST_ACTIVE = 1;
+constexpr std::uint8_t REQUEST_INVALIDATED = 2;
+
+constexpr std::uint32_t nodeBit(std::uint8_t node_id) {
+    return std::uint32_t{1} << node_id;
+}
 std::mutex console_output_mutex;
 
 // Demo-only message type; this does not add a DSM operation to section 5.
@@ -80,43 +88,6 @@ enum class PageState : std::uint8_t {
     Shared = 1,
     Modified = 2
 };
-
-enum class PageAccess {
-    Read,
-    Write
-};
-
-struct MsiAccessPolicy {
-    PageState granted_state;
-    bool request_home;
-    bool invalidate_other_copies;
-    bool retry_access;
-};
-
-MsiAccessPolicy msiPolicyForAccess(PageState state, PageAccess access) {
-    if (state == PageState::Modified ||
-        (state == PageState::Shared && access == PageAccess::Read)) {
-        return {state, false, false, false};
-    }
-    if (state == PageState::Invalid) {
-        return {PageState::Shared, true, false, access == PageAccess::Write};
-    }
-    return {PageState::Modified, true, true, false};
-}
-
-PageState msiOwnerStateAfterRequest(PageState owner_state, PageAccess access) {
-    if (access == PageAccess::Read && owner_state == PageState::Modified) {
-        return PageState::Shared;
-    }
-    if (access == PageAccess::Write) {
-        return PageState::Invalid;
-    }
-    return owner_state;
-}
-
-constexpr PageState msiStateAfterInvalidation() {
-    return PageState::Invalid;
-}
 
 enum class MessageType : std::uint8_t {
     Join = 1,
@@ -297,6 +268,9 @@ public:
             stats_[id].free_pages = pages_per_node;
             stats_[id].pages_i = pages_per_node;
         }
+        // Para el nodo local, M/S/I cuentan sus copias de todas las páginas del sistema.
+        stats_[local_node_id].pages_i =
+            static_cast<std::uint32_t>(node_count) * pages_per_node;
     }
 
     void configureNode(std::uint8_t node_id, std::uint32_t ipv4) {
@@ -362,6 +336,11 @@ public:
             throw std::logic_error("Contadores de liberación fuera de rango");
         }
         stats_[node_id].free_pages += count;
+    }
+
+    void recordTransfer(std::uint8_t node_id, bool sent) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++(sent ? stats_[node_id].pages_sent : stats_[node_id].pages_recv);
     }
 
     // Cuenta un fallo atendido y mueve la página entre los contadores M/S/I.
@@ -667,6 +646,7 @@ public:
         const std::uint32_t total_pages =
             static_cast<std::uint32_t>(config_.num_hosts) * config_.pages_per_node;
         page_table_.resize(total_pages);
+        request_state_.assign(total_pages, REQUEST_NONE);
         for (auto& page : page_table_) {
             page.state = static_cast<std::uint8_t>(PageState::Invalid);
             page.owner = NODE_NONE;
@@ -697,9 +677,11 @@ public:
             network_thread_ = std::thread(&Node::networkLoop, this);
             heartbeat_thread_ = std::thread(&Node::heartbeatLoop, this);
             join_thread_ = std::thread(&Node::joinLoop, this);
+            service_thread_ = std::thread(&Node::serviceLoop, this);
         } catch (...) {
             running_ = false;
             failPendingRequests();
+            stopService();
             if (network_thread_.joinable()) {
                 network_thread_.join();
             }
@@ -723,6 +705,7 @@ public:
     void stop() {
         running_ = false;
         failPendingRequests();
+        stopService();
         if (network_thread_.joinable()) {
             network_thread_.join();
         }
@@ -742,6 +725,16 @@ public:
         joinThreads(user_threads_, user_threads_mutex_);
         // Las aplicaciones ya terminaron: se puede liberar la región DSM.
         teardownMemory();
+    }
+
+    void stopService() {
+        {
+            std::lock_guard<std::mutex> lock(service_mutex_);
+            service_ready_.notify_all();
+        }
+        if (service_thread_.joinable()) {
+            service_thread_.join();
+        }
     }
 
     void launchUserThread(std::function<void()> application) {
@@ -1105,29 +1098,214 @@ private:
         }
     }
 
-    bool resolveFault(std::uint32_t page, bool write_access) {
-        const std::uint32_t local_start =
-            static_cast<std::uint32_t>(node_id_) * config_.pages_per_node;
-        std::lock_guard<std::mutex> lock(page_table_mutex_);
+    std::uint8_t homeOf(std::uint32_t page) const {
+        return static_cast<std::uint8_t>(page / config_.pages_per_node);
+    }
+
+    std::uint8_t* aliasPage(std::uint32_t page) const {
+        return alias_ + static_cast<std::size_t>(page) * config_.page_size;
+    }
+
+    // Cambia el estado MSI de la copia local. Requiere page_table_mutex_.
+    void setLocalState(std::uint32_t page, PageState next, bool fault) {
         PageEntry& entry = page_table_[page];
-        const bool local_page = page >= local_start &&
-                                page - local_start < config_.pages_per_node &&
-                                entry.proc_id != 0;
-        if (!local_page) {
-            // shortcut: páginas remotas o sin asignar fallan; PAGE_REQUEST llega en el día 3.
+        const auto current = static_cast<PageState>(entry.state);
+        if (next != current) {
+            protectPage(page, next);
+            entry.state = static_cast<std::uint8_t>(next);
+        }
+        node_table_.recordPageState(node_id_, current, next, fault);
+    }
+
+    bool resolveFault(std::uint32_t page, bool write_access) {
+        const std::uint8_t home = homeOf(page);
+        if (home == node_id_) {
+            return grantPage(page, node_id_, write_access, nullptr) == DSM_OK;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(page_table_mutex_);
+            request_state_[page] = REQUEST_ACTIVE;
+        }
+        std::vector<std::uint8_t> request;
+        appendU32(request, write_access ? 1U : 0U);
+        std::vector<std::uint8_t> data;
+        const int result = requestMessage(home, MessageType::PageRequest, page,
+                                          request, MessageType::PageData, data);
+
+        std::lock_guard<std::mutex> lock(page_table_mutex_);
+        const bool invalidated = request_state_[page] == REQUEST_INVALIDATED;
+        request_state_[page] = REQUEST_NONE;
+        if (result != DSM_OK || data.size() != config_.page_size) {
             return false;
         }
-        const auto current = static_cast<PageState>(entry.state);
-        const MsiAccessPolicy policy = msiPolicyForAccess(
-            current, write_access ? PageAccess::Write : PageAccess::Read);
-        // El nodo es home y la única copia, así que no hay que pedir ni invalidar.
-        // Si policy.retry_access, el reintento de la escritura sube S -> M.
-        if (policy.granted_state != current) {
-            protectPage(page, policy.granted_state);
-            entry.state = static_cast<std::uint8_t>(policy.granted_state);
+        if (invalidated) {
+            // Llegó un INVALIDATE mientras se esperaba la página: la copia puede
+            // ser vieja. Se descarta y el reintento del acceso pide otra.
+            return true;
         }
-        node_table_.recordPageState(node_id_, current, policy.granted_state, true);
+        std::memcpy(aliasPage(page), data.data(), config_.page_size);
+        node_table_.recordTransfer(node_id_, false);
+        setLocalState(page, write_access ? PageState::Modified : PageState::Shared, true);
         return true;
+    }
+
+    // Lado home: actualiza el directorio de la página para que `requester`
+    // obtenga S (lectura) o M (escritura). Si data no es nulo, deja ahí el
+    // contenido vigente para enviarlo. Puede esperar respuestas de la red, por eso
+    // nunca se llama desde el hilo de red.
+    int grantPage(std::uint32_t page, std::uint8_t requester, bool write_access,
+                  std::vector<std::uint8_t>* data) {
+        std::lock_guard<std::mutex> directory(directory_mutex_);
+        std::uint32_t copyset = 0;
+        std::uint8_t owner = NODE_NONE;
+        {
+            std::lock_guard<std::mutex> lock(page_table_mutex_);
+            const PageEntry& entry = page_table_[page];
+            if (entry.proc_id == 0) {
+                return DSM_E_BADADDR;
+            }
+            copyset = entry.copyset;
+            owner = entry.owner;
+        }
+
+        // Si otro nodo tiene la página en M, se recupera su contenido antes.
+        // Si el dueño es quien pide, perdió su copia sin escribirla (ver
+        // REQUEST_INVALIDATED) y la copia del home sigue vigente.
+        if (owner != node_id_ && owner != requester) {
+            revokeCopy(page, owner);
+        }
+        if (owner != node_id_) {
+            copyset &= ~nodeBit(owner);
+            owner = node_id_;
+        }
+
+        if (write_access) {
+            for (std::size_t id = 0; id < config_.num_hosts; ++id) {
+                const auto peer = static_cast<std::uint8_t>(id);
+                if (peer == requester || (copyset & nodeBit(peer)) == 0) {
+                    continue;
+                }
+                if (peer == node_id_) {
+                    std::lock_guard<std::mutex> lock(page_table_mutex_);
+                    setLocalState(page, PageState::Invalid, false);
+                } else {
+                    revokeCopy(page, peer);
+                }
+            }
+            copyset = nodeBit(requester);
+            owner = requester;
+        } else {
+            copyset |= nodeBit(requester);
+        }
+
+        std::lock_guard<std::mutex> lock(page_table_mutex_);
+        PageEntry& entry = page_table_[page];
+        entry.copyset = copyset;
+        entry.owner = owner;
+        if (requester == node_id_) {
+            setLocalState(page, write_access ? PageState::Modified : PageState::Shared, true);
+        } else {
+            if (!write_access && static_cast<PageState>(entry.state) == PageState::Modified) {
+                // El home deja de ser escritor único: baja a S para ver la copia compartida.
+                setLocalState(page, PageState::Shared, false);
+            }
+            if (data != nullptr) {
+                data->assign(aliasPage(page), aliasPage(page) + config_.page_size);
+                node_table_.recordTransfer(node_id_, true);
+            }
+        }
+        return DSM_OK;
+    }
+
+    // Invalida la copia de `peer`; si la tenía en M, guarda su contenido en el home.
+    void revokeCopy(std::uint32_t page, std::uint8_t peer) {
+        std::vector<std::uint8_t> data;
+        const int result = requestMessage(peer, MessageType::Invalidate, page, {},
+                                          MessageType::InvalidateAck, data);
+        if (result != DSM_OK) {
+            // shortcut: un nodo que no responde se da por caído y sin copia; si solo
+            // estaba lento, la coherencia se rompe. Mejorar con reintentos.
+            std::lock_guard<std::mutex> lock(console_output_mutex);
+            std::cerr << "dsm: nodo " << static_cast<unsigned int>(peer)
+                      << " no confirmó INVALIDATE de la página " << page
+                      << " (" << result << ")\n";
+            return;
+        }
+        if (data.size() == config_.page_size) {
+            std::lock_guard<std::mutex> lock(page_table_mutex_);
+            std::memcpy(aliasPage(page), data.data(), config_.page_size);
+            node_table_.recordTransfer(node_id_, false);
+        }
+    }
+
+    // Hilo de red: responde de inmediato, sin esperar a otros nodos.
+    void handleInvalidate(const MsgHeader& request) {
+        std::vector<std::uint8_t> data;
+        {
+            std::lock_guard<std::mutex> lock(page_table_mutex_);
+            if (request_state_[request.page] == REQUEST_ACTIVE) {
+                request_state_[request.page] = REQUEST_INVALIDATED;
+            }
+            const auto state = static_cast<PageState>(page_table_[request.page].state);
+            setLocalState(request.page, PageState::Invalid, false);
+            if (state == PageState::Modified) {
+                // La protección ya es PROT_NONE: nadie escribe mientras se copia.
+                data.assign(aliasPage(request.page),
+                            aliasPage(request.page) + config_.page_size);
+                node_table_.recordTransfer(node_id_, true);
+            }
+        }
+        MsgHeader reply{};
+        reply.type = static_cast<std::uint8_t>(MessageType::InvalidateAck);
+        reply.seq = request.seq;
+        reply.page = request.page;
+        sendFrame(request.sender, Channel::Control, reply,
+                  data.empty() ? nullptr : data.data(), data.size());
+    }
+
+    void handlePageRequest(const MsgHeader& request,
+                           const std::vector<std::uint8_t>& payload) {
+        std::uint32_t write_access = 0;
+        std::vector<std::uint8_t> data;
+        const int result = readU32(payload, 0, write_access) && write_access <= 1
+            ? grantPage(request.page, request.sender, write_access == 1, &data)
+            : DSM_E_INVAL;
+        MsgHeader reply{};
+        reply.type = static_cast<std::uint8_t>(MessageType::PageData);
+        reply.status = result == DSM_OK ? STATUS_OK : STATUS_INVALID;
+        reply.seq = request.seq;
+        reply.page = request.page;
+        sendFrame(request.sender, Channel::Control, reply,
+                  result == DSM_OK ? data.data() : nullptr,
+                  result == DSM_OK ? data.size() : 0);
+    }
+
+    // Las solicitudes que esperan a otros nodos se atienden aquí y no en el hilo
+    // de red, porque las respuestas que esperan llegan por el hilo de red.
+    void serviceLoop() {
+        while (true) {
+            ServiceJob job;
+            {
+                std::unique_lock<std::mutex> lock(service_mutex_);
+                service_ready_.wait(lock, [&] { return !running_ || !service_queue_.empty(); });
+                if (service_queue_.empty()) {
+                    return;
+                }
+                job = std::move(service_queue_.front());
+                service_queue_.pop_front();
+            }
+            try {
+                if (job.header.type == static_cast<std::uint8_t>(MessageType::PageRequest)) {
+                    handlePageRequest(job.header, job.payload);
+                } else {
+                    handleFreeRequest(job.header, job.payload);
+                }
+            } catch (const std::exception& error) {
+                std::lock_guard<std::mutex> lock(console_output_mutex);
+                std::cerr << "dsm: " << error.what() << '\n';
+            }
+        }
     }
 
     struct Connection {
@@ -1387,6 +1565,28 @@ private:
             return header.seq != 0 && header.page == PAGE_NONE &&
                    header.payload_len == 0 &&
                    header.status <= STATUS_INVALID;
+        case MessageType::PageRequest:
+            return header.seq != 0 && header.status == STATUS_OK &&
+                   header.page < page_table_.size() &&
+                   homeOf(header.page) == node_id_ &&
+                   header.payload_len == PAGE_INDEX_SIZE;
+        case MessageType::PageData:
+            return header.seq != 0 && header.page < page_table_.size() &&
+                   homeOf(header.page) == header.sender &&
+                   ((header.status == STATUS_OK &&
+                     header.payload_len == config_.page_size) ||
+                    (header.status == STATUS_INVALID && header.payload_len == 0));
+        case MessageType::Invalidate:
+            return header.seq != 0 && header.status == STATUS_OK &&
+                   header.page < page_table_.size() &&
+                   homeOf(header.page) == header.sender &&
+                   header.payload_len == 0;
+        case MessageType::InvalidateAck:
+            return header.seq != 0 && header.status == STATUS_OK &&
+                   header.page < page_table_.size() &&
+                   homeOf(header.page) == node_id_ &&
+                   (header.payload_len == 0 ||
+                    header.payload_len == config_.page_size);
         default:
             return false;
         }
@@ -1426,14 +1626,23 @@ private:
         case MessageType::JoinAck:
         case MessageType::AllocReply:
         case MessageType::FreeReply:
+        case MessageType::PageData:
+        case MessageType::InvalidateAck:
             completePending(header, std::move(connection.payload));
             break;
         case MessageType::AllocRequest:
             handleAllocRequest(header, connection.payload);
             break;
-        case MessageType::Free:
-            handleFreeRequest(header, connection.payload);
+        case MessageType::Invalidate:
+            handleInvalidate(header);
             break;
+        case MessageType::Free:
+        case MessageType::PageRequest: {
+            std::lock_guard<std::mutex> lock(service_mutex_);
+            service_queue_.push_back({header, std::move(connection.payload)});
+            service_ready_.notify_one();
+            break;
+        }
         default:
             break;
         }
@@ -1496,19 +1705,38 @@ private:
             return DSM_E_BADADDR;
         }
 
-        std::lock_guard<std::mutex> lock(page_table_mutex_);
-        const auto allocation = home_allocations_.find(first_page);
-        if (allocation == home_allocations_.end() ||
-            allocation->second.num_pages != count ||
-            allocation->second.proc_id != proc_id) {
-            return DSM_E_BADADDR;
-        }
-        for (std::uint32_t offset = 0; offset < count; ++offset) {
-            const PageEntry& entry = page_table_[first_page + offset];
-            if (entry.proc_id != proc_id || entry.order != offset) {
+        // Las copias remotas se invalidan antes de liberar; por eso esta función
+        // puede esperar a la red y no se llama desde el hilo de red (salvo el
+        // rollback de handleAllocRequest, cuyas páginas no tienen copias remotas).
+        std::lock_guard<std::mutex> directory(directory_mutex_);
+        std::vector<std::uint32_t> copysets(count);
+        {
+            std::lock_guard<std::mutex> lock(page_table_mutex_);
+            const auto allocation = home_allocations_.find(first_page);
+            if (allocation == home_allocations_.end() ||
+                allocation->second.num_pages != count ||
+                allocation->second.proc_id != proc_id) {
                 return DSM_E_BADADDR;
             }
+            for (std::uint32_t offset = 0; offset < count; ++offset) {
+                const PageEntry& entry = page_table_[first_page + offset];
+                if (entry.proc_id != proc_id || entry.order != offset) {
+                    return DSM_E_BADADDR;
+                }
+                copysets[offset] = entry.copyset | nodeBit(entry.owner);
+            }
         }
+        for (std::uint32_t offset = 0; offset < count; ++offset) {
+            for (std::size_t id = 0; id < config_.num_hosts; ++id) {
+                const auto peer = static_cast<std::uint8_t>(id);
+                if (peer != node_id_ && (copysets[offset] & nodeBit(peer)) != 0) {
+                    revokeCopy(first_page + offset, peer);
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(page_table_mutex_);
+        const auto allocation = home_allocations_.find(first_page);
         for (std::uint32_t offset = 0; offset < count; ++offset) {
             const auto state =
                 static_cast<PageState>(page_table_[first_page + offset].state);
@@ -1604,7 +1832,8 @@ private:
             : response.type == static_cast<std::uint8_t>(MessageType::AllocReply) &&
                       response.status == STATUS_NO_SPACE
                 ? DSM_E_NOMEM
-                : response.type == static_cast<std::uint8_t>(MessageType::FreeReply)
+                : response.type == static_cast<std::uint8_t>(MessageType::FreeReply) ||
+                          response.type == static_cast<std::uint8_t>(MessageType::PageData)
                     ? DSM_E_BADADDR
                     : DSM_E_NET;
         pending->complete = true;
@@ -1839,6 +2068,19 @@ private:
     std::unordered_map<std::uintptr_t, Allocation> allocations_;
     std::unordered_map<std::uint32_t, Allocation> home_allocations_;
     std::atomic<std::size_t> allocation_cursor_{0};
+
+    // Directorio de las páginas home: serializa grantPage y releaseAtHome.
+    std::mutex directory_mutex_;
+    // Por página: si el hilo de fallos espera PAGE_DATA (REQUEST_*).
+    std::vector<std::uint8_t> request_state_;
+    struct ServiceJob {
+        MsgHeader header;
+        std::vector<std::uint8_t> payload;
+    };
+    std::mutex service_mutex_;
+    std::condition_variable service_ready_;
+    std::deque<ServiceJob> service_queue_;
+    std::thread service_thread_;
 
     // Región DSM local (ver setupMemory).
     int memfd_ = -1;

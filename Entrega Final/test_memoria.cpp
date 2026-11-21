@@ -24,13 +24,13 @@ int main() {
     data[0] = 'A';
     assert(stats().faults == 2 && stats().pages_m == 1 && stats().pages_s == 0);
 
-    // Página 1: escritura directa, dos fallos (I -> S y el reintento S -> M).
+    // Página 1: escritura directa, un solo fallo (I -> M).
     std::strcpy(data + page, "hola DSM");
-    assert(stats().faults == 4 && stats().pages_m == 2);
+    assert(stats().faults == 3 && stats().pages_m == 2);
 
     // Accesos a páginas ya en M no generan fallos.
     data[1] = 'B';
-    assert(stats().faults == 4);
+    assert(stats().faults == 3);
     assert(std::strcmp(data + page, "hola DSM") == 0);
 
     // Al liberar, las páginas vuelven a I y se limpian para el siguiente proceso.
