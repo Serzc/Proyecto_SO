@@ -14,6 +14,7 @@ Autores: Sergio Andrés Zúñiga Castillo y José Ignacio Madriz Ortiz.
 ```
 make          # compila libdsm.a, dsmnode, wordcount, matmul y las pruebas
 make test     # pruebas automáticas en una sola máquina
+make bench    # tiempos de las tres apps con 1, 2 y 3 nodos locales
 ```
 
 ## Configuración (`dsm.conf`)
@@ -58,7 +59,7 @@ Las aplicaciones también existen como programas aparte que inician su propio no
 
 Cada proceso que llama a `dsm_init` es un nodo par. Todos los nodos mapean el mismo rango de direcciones con `mmap`, con las páginas en `PROT_NONE`. Al tocar una página sin permiso ocurre un `SIGSEGV`. El manejador pasa la página a un hilo de fallos, que la pide por TCP a su nodo home y aplica `mprotect` según el estado MSI (I sin acceso, S lectura, M lectura y escritura). El home guarda un directorio con el dueño y las copias de cada página, invalida las copias antes de conceder escritura y recupera las páginas modificadas.
 
-`dsm_alloc(size, proc)` funciona como un segmento compartido: el mismo `proc` devuelve la misma región en cualquier nodo. Su home es `proc % nodos`, que lleva la cuenta de qué nodos están unidos, y `dsm_free` solo libera la región cuando la suelta el último.
+`dsm_alloc(size, proc)` funciona como un segmento compartido: el mismo `proc` devuelve la misma región en cualquier nodo. Su home es `proc % nodos`, que lleva la cuenta de qué nodos están unidos, y `dsm_free` solo libera la región cuando la suelta el último. Si el segmento no cabe en ese home, el nodo pide el resto a los nodos siguientes: el segmento ocupa el final del rango del home y el principio del rango del siguiente, con la dirección continua.
 
 | Módulo | Contenido |
 |---|---|
