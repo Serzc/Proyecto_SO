@@ -1,5 +1,6 @@
 // Programa dsmnode: consola del nodo (nodes, stats, pages, mensajes).
 #include "dsm_internal.h"
+#include <termios.h>
 
 namespace dsm {
 
@@ -30,7 +31,8 @@ void printHelp() {
     std::cout << "Comandos:\n"
                  "  nodes                             nodos configurados y su estado\n"
                  "  stats                             estadísticas de todos los nodos\n"
-                 "  pages <node_id>                   páginas asignadas en ese home\n"
+                 "  pages                             vista de páginas por nodo (flechas, q sale)\n"
+                 "  pages <node_id>                   lista las páginas asignadas en ese home\n"
                  "  run <wordcount|matmul> [args]     corre una aplicación en este nodo\n"
                  "  monitor                           mensajes recibidos y cambios de nodos (Enter sale)\n"
                  "  send <id> <data|control> <texto>  mensaje de prueba a un nodo\n"
@@ -51,6 +53,181 @@ const char* stateName(std::uint8_t state) {
     return state == static_cast<std::uint8_t>(PageState::Modified) ? "M"
          : state == static_cast<std::uint8_t>(PageState::Shared)   ? "S"
                                                                    : "I";
+}
+
+// Tabla completa de las páginas cuyo home es info.node_id (local o por QUERY).
+int fetchHomePages(Node& node, const NodeInfo& info, std::vector<PageEntry>& out) {
+    out.clear();
+    for (std::uint32_t first = info.first_page; first < info.first_page + info.num_pages;
+         first += QUERY_MAX) {
+        const auto count = std::min<std::uint32_t>(
+            QUERY_MAX, info.first_page + info.num_pages - first);
+        std::vector<PageEntry> chunk;
+        const int result = node.queryPageTable(info.node_id, first, count, chunk);
+        if (result != DSM_OK) {
+            return result;
+        }
+        out.insert(out.end(), chunk.begin(), chunk.end());
+    }
+    return DSM_OK;
+}
+
+// "0,2" para un conjunto de nodos en bits.
+std::string nodeList(std::uint32_t nodes, std::size_t node_count) {
+    std::string text;
+    for (std::size_t id = 0; id < node_count; ++id) {
+        if ((nodes & nodeBit(static_cast<std::uint8_t>(id))) != 0) {
+            text += (text.empty() ? "" : ",") + std::to_string(id);
+        }
+    }
+    return text.empty() ? "-" : text;
+}
+
+// Una asignación (páginas contiguas de un proceso) en el home.
+struct HomeAllocation {
+    std::uint32_t proc_id = 0;
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+    std::uint32_t states[3] = {0, 0, 0};  // Copia del home en I, S y M.
+    std::uint32_t copies = 0;             // Nodos con copia de alguna página.
+    std::uint32_t owners = 0;             // Nodos con alguna página en M.
+};
+
+// Pinta una vista de páginas del nodo target. Requiere console_output_mutex.
+void renderPagesView(Node& node, std::uint8_t target) {
+    const auto entries = node.nodes();
+    const NodeInfo& info = entries[target];
+    const Config& config = node.config();
+    const bool online = info.state == static_cast<std::uint8_t>(NodeState::Online);
+
+    std::printf("\033[2J\033[H");  // Limpia la pantalla.
+    std::printf("Páginas del nodo %u (nodos 0 a %zu)   (<- -> cambia de nodo, q o Enter sale; "
+                "se actualiza cada segundo)\n",
+                static_cast<unsigned int>(target), entries.size() - 1);
+    std::printf("Estado: %s   Host: %s   Rango: páginas %u a %u\n\n",
+                online ? "EN LINEA" : "CAIDO", config.hosts[target], info.first_page,
+                info.first_page + info.num_pages - 1);
+    NodeStats stats{};
+    std::vector<PageEntry> pages;
+    const int result = online ? node.queryStats(target, stats) : DSM_E_NODE_DOWN;
+    const int pages_result = result == DSM_OK ? fetchHomePages(node, info, pages) : result;
+    if (pages_result != DSM_OK) {
+        std::printf("Sin datos: %s\n", dsm_strerror(pages_result));
+        std::fflush(stdout);
+        return;
+    }
+
+    const std::uint32_t used = stats.total_pages - stats.free_pages;
+    std::printf("Memoria que aporta: %u páginas de %u bytes; %u usadas, %u libres (%u%% en uso)\n",
+                stats.total_pages, config.page_size, used, stats.free_pages,
+                stats.total_pages == 0 ? 0U : 100U * used / stats.total_pages);
+    std::printf("Copias que tiene de todo el DSM: M %u, S %u, I %u\n", stats.pages_m,
+                stats.pages_s, stats.pages_i);
+    std::printf("Fallos atendidos %u, páginas enviadas %u, recibidas %u\n\n", stats.faults,
+                stats.pages_sent, stats.pages_recv);
+
+    // Agrupa las páginas en asignaciones y asigna una letra por proceso para el mapa.
+    std::vector<HomeAllocation> allocations;
+    std::vector<std::uint32_t> procs;
+    std::string map(pages.size(), '.');
+    for (std::uint32_t index = 0; index < pages.size(); ++index) {
+        const PageEntry& entry = pages[index];
+        if (entry.proc_id == 0) {
+            continue;
+        }
+        if (entry.order == 0 || allocations.empty() ||
+            allocations.back().proc_id != entry.proc_id ||
+            allocations.back().first + allocations.back().count != info.first_page + index) {
+            allocations.push_back({});
+            allocations.back().proc_id = entry.proc_id;
+            allocations.back().first = info.first_page + index;
+        }
+        HomeAllocation& allocation = allocations.back();
+        ++allocation.count;
+        ++allocation.states[entry.state <= 2 ? entry.state : 0];
+        allocation.copies |= entry.copyset;
+        if (entry.owner != target && entry.owner < MAX_NODES) {
+            allocation.owners |= nodeBit(entry.owner);
+        }
+        auto letter = std::find(procs.begin(), procs.end(), entry.proc_id);
+        if (letter == procs.end()) {
+            procs.push_back(entry.proc_id);
+            letter = procs.end() - 1;
+        }
+        const auto position = static_cast<std::size_t>(letter - procs.begin());
+        map[index] = position < 26 ? static_cast<char>('A' + position) : '#';
+    }
+
+    std::printf("Mapa (cada carácter es una página: . libre, letra = proceso):\n");
+    for (std::size_t row = 0; row < map.size(); row += 64) {
+        std::printf("%6zu  %s\n", info.first_page + row, map.substr(row, 64).c_str());
+    }
+
+    std::printf("\nAsignaciones (%zu):\n", allocations.size());
+    if (!allocations.empty()) {
+        std::printf("  Proc  Letra      Páginas   Cant  Dirección        Home I/S/M  "
+                    "Copias en  Escritor\n");
+    }
+    for (const HomeAllocation& allocation : allocations) {
+        const auto letter = std::find(procs.begin(), procs.end(), allocation.proc_id) -
+                            procs.begin();
+        const std::string range = std::to_string(allocation.first) + "-" +
+                                  std::to_string(allocation.first + allocation.count - 1);
+        const std::string states = std::to_string(allocation.states[0]) + "/" +
+                                   std::to_string(allocation.states[1]) + "/" +
+                                   std::to_string(allocation.states[2]);
+        std::printf("%6u  %5c  %11s  %5u  0x%012llx  %11s  %-9s  %s\n", allocation.proc_id,
+                    letter < 26 ? static_cast<char>('A' + letter) : '#', range.c_str(),
+                    allocation.count,
+                    static_cast<unsigned long long>(
+                        config.dsm_base +
+                        static_cast<std::uint64_t>(allocation.first) * config.page_size),
+                    states.c_str(), nodeList(allocation.copies, entries.size()).c_str(),
+                    allocation.owners == 0 ? "home"
+                                           : nodeList(allocation.owners, entries.size()).c_str());
+    }
+    std::fflush(stdout);
+}
+
+// Vista interactiva de páginas: flechas izquierda/derecha cambian de nodo.
+void pagesView(Node& node) {
+    termios saved{};
+    const bool raw = tcgetattr(STDIN_FILENO, &saved) == 0;
+    if (raw) {
+        termios keys = saved;
+        keys.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+        keys.c_cc[VMIN] = 1;
+        keys.c_cc[VTIME] = 0;
+        tcsetattr(STDIN_FILENO, TCSANOW, &keys);
+    }
+    const auto node_count = static_cast<int>(node.nodes().size());
+    int target = node.nodeId();
+    while (true) {
+        {
+            std::lock_guard<std::mutex> lock(console_output_mutex);
+            renderPagesView(node, static_cast<std::uint8_t>(target));
+        }
+        pollfd input{STDIN_FILENO, POLLIN, 0};
+        if (poll(&input, 1, 1000) == 0) {
+            continue;  // Sin teclas: refresca.
+        }
+        const int key = std::cin.get();
+        if (key == EOF || key == 'q' || key == '\n') {
+            break;
+        }
+        if (key == 0x1b && std::cin.get() == '[') {  // Flechas: ESC [ C o ESC [ D.
+            const int arrow = std::cin.get();
+            if (arrow == 'C') {
+                target = (target + 1) % node_count;
+            } else if (arrow == 'D') {
+                target = (target + node_count - 1) % node_count;
+            }
+        }
+    }
+    if (raw) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &saved);
+    }
+    std::cout << '\n';
 }
 
 // stats: estadísticas de todos los nodos y del sistema.
@@ -118,37 +295,26 @@ bool handleQueryCommand(Node& node, const std::string& command) {
     std::printf("\nPáginas asignadas con home en el nodo %u (estado = copia del home):\n"
                 "Página  Dirección       Proceso  Orden  Dueño  Estado  Copias\n",
                 static_cast<unsigned int>(target));
+    std::vector<PageEntry> pages;
+    const int result = fetchHomePages(node, info, pages);
+    if (result != DSM_OK) {
+        std::printf("Sin respuesta del nodo %u: %s\n",
+                    static_cast<unsigned int>(target), dsm_strerror(result));
+        return true;
+    }
     unsigned int shown = 0;
-    for (std::uint32_t first = info.first_page; first < info.first_page + info.num_pages;
-         first += QUERY_MAX) {
-        const auto count = std::min<std::uint32_t>(
-            QUERY_MAX, info.first_page + info.num_pages - first);
-        std::vector<PageEntry> pages;
-        const int result = node.queryPageTable(target, first, count, pages);
-        if (result != DSM_OK) {
-            std::printf("Sin respuesta del nodo %u: %s\n",
-                        static_cast<unsigned int>(target), dsm_strerror(result));
-            return true;
+    for (std::uint32_t index = 0; index < info.num_pages; ++index) {
+        const PageEntry& entry = pages[index];
+        if (entry.proc_id == 0) {
+            continue;
         }
-        for (std::uint32_t index = 0; index < count; ++index) {
-            const PageEntry& entry = pages[index];
-            if (entry.proc_id == 0) {
-                continue;
-            }
-            std::string copies;
-            for (std::size_t id = 0; id < entries.size(); ++id) {
-                if ((entry.copyset & nodeBit(static_cast<std::uint8_t>(id))) != 0) {
-                    copies += (copies.empty() ? "" : ",") + std::to_string(id);
-                }
-            }
-            std::printf("%6u  0x%012llx  %7u  %5u  %5u  %6s  %s\n", first + index,
-                        static_cast<unsigned long long>(
-                            config.dsm_base +
-                            static_cast<std::uint64_t>(first + index) * config.page_size),
-                        entry.proc_id, entry.order, static_cast<unsigned int>(entry.owner),
-                        stateName(entry.state), copies.c_str());
-            ++shown;
-        }
+        const std::uint32_t page = info.first_page + index;
+        std::printf("%6u  0x%012llx  %7u  %5u  %5u  %6s  %s\n", page,
+                    static_cast<unsigned long long>(
+                        config.dsm_base + static_cast<std::uint64_t>(page) * config.page_size),
+                    entry.proc_id, entry.order, static_cast<unsigned int>(entry.owner),
+                    stateName(entry.state), nodeList(entry.copyset, entries.size()).c_str());
+        ++shown;
     }
     std::printf("%u de %u páginas asignadas.\n", shown, info.num_pages);
     std::fflush(stdout);
@@ -323,7 +489,9 @@ int main(int argc, char* argv[]) {
             if (command == "quit" || command == "exit") {
                 break;
             }
-            if (command == "nodes") {
+            if (command == "pages") {
+                dsm::pagesView(node);
+            } else if (command == "nodes") {
                 dsm::printNodes(node, dsm::console_output_mutex);
             } else if (command == "help") {
                 dsm::printHelp();

@@ -40,7 +40,7 @@ En cada máquina se inicia un nodo con su consola:
 ./dsmnode dsm.conf <id>
 ```
 
-Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). Las aplicaciones corren dentro del nodo ya iniciado:
+Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso y las asignaciones con sus copias. Las aplicaciones corren dentro del nodo ya iniciado:
 
 ```
 run matmul                                       # en los nodos 1, 2, ... (trabajadores)
