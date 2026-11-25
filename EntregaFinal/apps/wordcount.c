@@ -69,7 +69,7 @@ static char* read_file(const char* path, uint64_t* length) {
     return data;
 }
 
-static void coordinator(const char* path) {
+static int coordinator(const char* path) {
     const size_t page = dsm_page_size();
     const uint32_t workers = (uint32_t)app_node_count() - 1;
     if (workers == 0) {
@@ -131,10 +131,7 @@ static void coordinator(const char* path) {
     usleep(500 * 1000);
     app_check(dsm_free(control), "dsm_free control");
     free(local);
-    if (!ok) {
-        dsm_shutdown();
-        exit(1);
-    }
+    return ok ? 0 : 1;
 }
 
 static void worker(int node_id) {
@@ -165,18 +162,30 @@ static void worker(int node_id) {
     sleep(2); /* El coordinador libera el bloque de control mientras seguimos en línea. */
 }
 
+/* Corre la aplicación en el nodo ya iniciado de este proceso. Lo usan el
+   comando run de dsmnode y el main de abajo. En el nodo 0 recibe <archivo>. */
+int wordcount_run(int node_id, int argc, char* argv[]) {
+    if (node_id == 0) {
+        if (argc < 1) {
+            fprintf(stderr, "Uso en el nodo 0: wordcount <archivo>\n");
+            return 2;
+        }
+        return coordinator(argv[0]);
+    }
+    worker(node_id);
+    return 0;
+}
+
+#ifndef APP_NO_MAIN
 int main(int argc, char* argv[]) {
-    if (argc < 3 || (atoi(argv[2]) == 0 && argc < 4)) {
-        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> [archivo (solo nodo 0)]\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> [<archivo> (solo nodo 0)]\n", argv[0]);
         return 2;
     }
     const int node_id = atoi(argv[2]);
     app_check(dsm_init(argv[1], node_id), "dsm_init");
-    if (node_id == 0) {
-        coordinator(argv[3]);
-    } else {
-        worker(node_id);
-    }
+    const int result = wordcount_run(node_id, argc - 3, argv + 3);
     dsm_shutdown();
-    return 0;
+    return result;
 }
+#endif

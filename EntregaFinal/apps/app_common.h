@@ -11,7 +11,9 @@
 
 #define APP_MAX_NODES 32
 
-/* Termina con un mensaje si una llamada al DSM falla. */
+/* Termina con un mensaje si una llamada al DSM falla.
+   shortcut: dentro de dsmnode (run) esto cierra también la consola; devolver el error
+   si se necesita que el nodo sobreviva a una aplicación fallida. */
 static void app_check(int result, const char* what) {
     if (result < 0) {
         fprintf(stderr, "%s: %s\n", what, dsm_strerror(result));

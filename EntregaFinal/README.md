@@ -34,15 +34,24 @@ Para varios nodos en una sola máquina se repite `127.0.0.1` (ejemplo: `apps/loc
 
 ## Ejecutar
 
+En cada máquina se inicia un nodo con su consola:
+
 ```
-./dsmnode dsm.conf <id>                                   # consola: nodes, stats, pages <id>, quit
-./wordcount dsm.conf <id>                                 # trabajadores (id >= 1)
-./wordcount dsm.conf 0 data/enunciado_dsm.txt             # coordinador
-./matmul dsm.conf <id>                                    # trabajadores
-./matmul dsm.conf 0 data/matriz_a.txt data/matriz_b.txt   # coordinador
+./dsmnode dsm.conf <id>
 ```
 
-El coordinador compara el resultado con un cálculo secuencial e imprime `CORRECTA` o `ERROR`.
+Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). Las aplicaciones corren dentro del nodo ya iniciado:
+
+```
+run matmul                                       # en los nodos 1, 2, ... (trabajadores)
+run matmul data/matriz_a.txt data/matriz_b.txt   # en el nodo 0 (coordinador)
+run wordcount                                    # trabajadores
+run wordcount data/enunciado_dsm.txt             # coordinador
+```
+
+El coordinador compara el resultado con un cálculo secuencial e imprime `CORRECTA` o `ERROR`. `quit` espera a que terminen las aplicaciones en curso.
+
+Las aplicaciones también existen como programas aparte que inician su propio nodo: `./matmul dsm.conf <id> [archivos]` y `./wordcount dsm.conf <id> [archivo]`.
 
 ## Arquitectura
 

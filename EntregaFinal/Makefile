@@ -19,7 +19,11 @@ libdsm.a: $(LIB_OBJS)
 apps/%.o: apps/%.c apps/app_common.h dsm.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-dsmnode: main.o libdsm.a
+# Las mismas aplicaciones sin main, enlazadas en dsmnode para el comando run.
+apps/%_lib.o: apps/%.c apps/app_common.h dsm.h
+	$(CC) $(CFLAGS) -DAPP_NO_MAIN -c $< -o $@
+
+dsmnode: main.o apps/wordcount_lib.o apps/matmul_lib.o libdsm.a
 	$(CXX) $(LDFLAGS) $^ -o $@
 
 wordcount: apps/wordcount.o libdsm.a

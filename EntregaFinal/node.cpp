@@ -5,6 +5,47 @@ namespace dsm {
 
 std::mutex console_output_mutex;
 
+namespace {
+
+constexpr std::size_t MONITOR_HISTORY = 50;
+std::deque<std::string> monitor_events;  // Últimos eventos, protegidos por console_output_mutex.
+bool monitor_live = false;
+
+}  // namespace
+
+void monitorEvent(const std::string& text) {
+    char stamp[16] = "";
+    const std::time_t now = std::time(nullptr);
+    std::tm local{};
+    if (localtime_r(&now, &local) != nullptr) {
+        std::strftime(stamp, sizeof(stamp), "[%H:%M:%S] ", &local);
+    }
+    std::lock_guard<std::mutex> lock(console_output_mutex);
+    monitor_events.push_back(stamp + text);
+    if (monitor_events.size() > MONITOR_HISTORY) {
+        monitor_events.pop_front();
+    }
+    if (monitor_live) {
+        std::cout << monitor_events.back() << '\n' << std::flush;
+    }
+}
+
+void setMonitorLive(bool live) {
+    std::lock_guard<std::mutex> lock(console_output_mutex);
+    monitor_live = live;
+    if (!live) {
+        return;
+    }
+    std::cout << "Eventos recientes:\n";
+    if (monitor_events.empty()) {
+        std::cout << "(ninguno)\n";
+    }
+    for (const std::string& event : monitor_events) {
+        std::cout << event << '\n';
+    }
+    std::cout << "--- en vivo; presione Enter para salir ---\n" << std::flush;
+}
+
 Node::Node(Config config, std::uint8_t node_id)
     : config_(config), node_id_(node_id),
       node_table_(config.num_hosts, node_id, config.pages_per_node) {
@@ -123,6 +164,10 @@ void Node::stopService() {
     if (service_thread_.joinable()) {
         service_thread_.join();
     }
+}
+
+void Node::waitUserThreads() {
+    joinThreads(user_threads_, user_threads_mutex_);
 }
 
 void Node::launchUserThread(std::function<void()> application) {

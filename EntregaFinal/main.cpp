@@ -7,22 +7,35 @@ void printNodes(const Node& node, std::mutex& output_mutex) {
     const auto entries = node.nodes();
     const Config& config = node.config();
     std::lock_guard<std::mutex> lock(output_mutex);
-    std::cout << "\nNodos configurados (" << entries.size() << "):\n"
-              << "ID  Estado   Host                 Datos  Control  Heartbeat\n";
+    // Encabezados y valores con el mismo formato; solo ASCII para que printf
+    // cuente bien los anchos.
+    const char* format = "%-3s %-9s %-20s %6s %8s %10s\n";
+    std::printf("\nNodos configurados (%zu):\n", entries.size());
+    std::printf(format, "ID", "Estado", "Host", "Datos", "Control", "Heartbeat");
     for (const auto& entry : entries) {
-        const char* state =
-            entry.state == static_cast<std::uint8_t>(NodeState::Online)
-                ? "EN LINEA"
-                : "CAIDO";
-        std::cout << static_cast<unsigned int>(entry.node_id) << "   "
-                  << state << "  "
-                  << config.hosts[entry.node_id] << "  "
-                  << channelPort(config, entry.node_id, Channel::Data) << "  "
-                  << channelPort(config, entry.node_id, Channel::Control) << "  "
-                  << channelPort(config, entry.node_id, Channel::Heartbeat) << '\n';
+        std::printf(format, std::to_string(entry.node_id).c_str(),
+                    entry.state == static_cast<std::uint8_t>(NodeState::Online)
+                        ? "EN LINEA"
+                        : "CAIDO",
+                    config.hosts[entry.node_id],
+                    std::to_string(channelPort(config, entry.node_id, Channel::Data)).c_str(),
+                    std::to_string(channelPort(config, entry.node_id, Channel::Control)).c_str(),
+                    std::to_string(channelPort(config, entry.node_id, Channel::Heartbeat)).c_str());
     }
-    std::cout << "Comandos: nodes | stats | pages <node_id> | broadcast <data|control> <mensaje> | "
-                 "send <node_id> <data|control> <mensaje> | quit\n"
+    std::fflush(stdout);
+}
+
+void printHelp() {
+    std::lock_guard<std::mutex> lock(console_output_mutex);
+    std::cout << "Comandos:\n"
+                 "  nodes                             nodos configurados y su estado\n"
+                 "  stats                             estadísticas de todos los nodos\n"
+                 "  pages <node_id>                   páginas asignadas en ese home\n"
+                 "  run <wordcount|matmul> [args]     corre una aplicación en este nodo\n"
+                 "  monitor                           mensajes recibidos y cambios de nodos (Enter sale)\n"
+                 "  send <id> <data|control> <texto>  mensaje de prueba a un nodo\n"
+                 "  broadcast <data|control> <texto>  mensaje de prueba a todos\n"
+                 "  help, quit\n"
               << std::flush;
 }
 
@@ -103,7 +116,7 @@ bool handleQueryCommand(Node& node, const std::string& command) {
     const NodeInfo& info = entries[target];
     const Config& config = node.config();
     std::printf("\nPáginas asignadas con home en el nodo %u (estado = copia del home):\n"
-                "Página  Dirección        Proceso  Orden  Dueño  Estado  Copias\n",
+                "Página  Dirección       Proceso  Orden  Dueño  Estado  Copias\n",
                 static_cast<unsigned int>(target));
     unsigned int shown = 0;
     for (std::uint32_t first = info.first_page; first < info.first_page + info.num_pages;
@@ -219,6 +232,39 @@ bool handleDemoCommand(const Node& node, const std::string& command) {
 
 }  // namespace dsm
 
+extern "C" int wordcount_run(int node_id, int argc, char* argv[]);
+extern "C" int matmul_run(int node_id, int argc, char* argv[]);
+
+// run <app> [argumentos]: corre la aplicación en un hilo de este nodo, sin
+// detenerlo; la consola sigue disponible mientras tanto.
+void runApp(dsm::Node& node, const std::string& command) {
+    std::istringstream input(command);
+    std::string word;
+    std::string app;
+    input >> word >> app;
+    int (*entry)(int, int, char**) = app == "wordcount" ? wordcount_run
+                                   : app == "matmul"    ? matmul_run
+                                                        : nullptr;
+    if (entry == nullptr) {
+        std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
+        std::cout << "Uso: run <wordcount|matmul> [argumentos]\n" << std::flush;
+        return;
+    }
+    std::vector<std::string> args;
+    for (std::string arg; input >> arg;) {
+        args.push_back(arg);
+    }
+    const int node_id = node.nodeId();
+    node.launchUserThread([entry, app, args, node_id]() mutable {
+        std::vector<char*> argv;
+        for (auto& arg : args) {
+            argv.push_back(arg.data());
+        }
+        const int result = entry(node_id, static_cast<int>(argv.size()), argv.data());
+        std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
+        std::cout << app << " terminó (código " << result << ")\n" << std::flush;
+    });
+}
 
 int main(int argc, char* argv[]) {
     if (argc != 3) {
@@ -227,10 +273,15 @@ int main(int argc, char* argv[]) {
     }
 
     try {
-        const dsm::Config config = dsm::loadConfig(argv[1]);
         const std::uint8_t node_id = dsm::parseNodeId(argv[2]);
-        dsm::Node node(config, node_id);
-        node.start();
+        // El nodo se crea con el API para que las aplicaciones lanzadas con run
+        // usen este mismo nodo.
+        const int init_result = dsm_init(argv[1], node_id);
+        if (init_result != DSM_OK) {
+            std::cerr << "Error: " << dsm_strerror(init_result) << '\n';
+            return 1;
+        }
+        dsm::Node& node = *dsm::apiNode();
 
         std::atomic<bool> monitor_running{true};
         std::thread monitor([&] {
@@ -243,36 +294,63 @@ int main(int argc, char* argv[]) {
                     changed = current[id].state != previous[id].state;
                 }
                 if (changed) {
-                    dsm::printNodes(node, dsm::console_output_mutex);
+                    for (std::size_t id = 0; id < current.size(); ++id) {
+                        if (id >= previous.size() || current[id].state != previous[id].state) {
+                            dsm::monitorEvent(
+                                "Nodo " + std::to_string(id) + ": " +
+                                (current[id].state ==
+                                         static_cast<std::uint8_t>(dsm::NodeState::Online)
+                                     ? "EN LINEA"
+                                     : "CAIDO"));
+                        }
+                    }
                     previous = current;
                 }
             }
         });
 
+        std::cout << "Nodo " << static_cast<unsigned int>(node_id) << " iniciado.\n";
         dsm::printNodes(node, dsm::console_output_mutex);
+        dsm::printHelp();
+        const auto prompt = [] {
+            std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
+            std::cout << "dsm> " << std::flush;
+            return true;
+        };
         std::string command;
-        while (std::getline(std::cin, command)) {
+        while (prompt() && std::getline(std::cin, command)) {
             command = dsm::trim(command);
             if (command == "quit" || command == "exit") {
                 break;
             }
             if (command == "nodes") {
                 dsm::printNodes(node, dsm::console_output_mutex);
+            } else if (command == "help") {
+                dsm::printHelp();
+            } else if (command == "monitor") {
+                dsm::printNodes(node, dsm::console_output_mutex);
+                dsm::setMonitorLive(true);
+                std::string ignored;
+                std::getline(std::cin, ignored);
+                dsm::setMonitorLive(false);
+            } else if (command == "run" || command.rfind("run ", 0) == 0) {
+                runApp(node, command);
             } else if (dsm::handleQueryCommand(node, command) ||
                        dsm::handleDemoCommand(node, command)) {
                 continue;
             } else if (!command.empty()) {
                 std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
-                std::cout << "Comando desconocido. Use: nodes | stats | pages <node_id> | broadcast "
-                             "<data|control> <mensaje> | send <node_id> "
-                             "<data|control> <mensaje> | quit\n"
+                std::cout << "Comando desconocido. Escriba help para ver los comandos.\n"
                           << std::flush;
             }
         }
 
         monitor_running = false;
         monitor.join();
-        node.stop();
+        // Primero terminan las aplicaciones: dsm_shutdown las esperaría con el
+        // mutex del API tomado, y ellas lo necesitan para terminar.
+        node.waitUserThreads();
+        dsm_shutdown();
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';
         return 1;

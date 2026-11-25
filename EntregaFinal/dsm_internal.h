@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <condition_variable>
 #include <fcntl.h>
@@ -75,6 +76,10 @@ constexpr std::uint32_t nodeBit(std::uint8_t node_id) {
     return std::uint32_t{1} << node_id;
 }
 extern std::mutex console_output_mutex;
+// Registro de eventos (mensajes recibidos, cambios de estado de nodos). Solo se
+// imprimen en vivo dentro del comando monitor, para no cortar lo que se escribe.
+void monitorEvent(const std::string& text);
+void setMonitorLive(bool live);
 
 enum class Channel : std::uint8_t {
     Data = 0,
@@ -391,6 +396,8 @@ public:
     void stopService();
 
     void launchUserThread(std::function<void()> application);
+    // Espera a que terminen las aplicaciones lanzadas con launchUserThread.
+    void waitUserThreads();
 
     std::vector<NodeInfo> nodes() const;
 
@@ -557,6 +564,9 @@ private:
     std::unique_ptr<std::atomic<std::uint32_t>[]> fault_generations_;
     std::unique_ptr<std::atomic<std::uint8_t>[]> fault_failed_;
 };
+
+// Nodo creado por dsm_init en este proceso (nulo si no hay); lo usa la consola.
+Node* apiNode();
 
 }  // namespace dsm
 

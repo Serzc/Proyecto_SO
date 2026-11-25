@@ -8,6 +8,11 @@ std::unique_ptr<dsm::Node> api_node;
 
 }
 
+dsm::Node* dsm::apiNode() {
+    std::lock_guard<std::mutex> lock(api_mutex);
+    return api_node.get();
+}
+
 extern "C" int dsm_init(const char* config_path, int node_id) {
     if (config_path == nullptr || node_id < 0 ||
         node_id >= static_cast<int>(dsm::MAX_NODES)) {

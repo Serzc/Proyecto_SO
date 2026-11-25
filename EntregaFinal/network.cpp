@@ -415,14 +415,10 @@ void Node::handleMessage(Connection& connection) {
         const char* channel_name =
             connection.channel == Channel::Data ? "data" : "control";
         const char* delivery =
-            header.flags == DEMO_BROADCAST ? "broadcast" : "direct";
-        std::lock_guard<std::mutex> lock(console_output_mutex);
-        std::cout << "\nReceived " << delivery << " from node "
-                  << static_cast<unsigned int>(header.sender)
-                  << " on " << channel_name << ": " << message << '\n'
-                  << "Comandos: nodes | stats | pages <node_id> | broadcast <data|control> <mensaje> | "
-                     "send <node_id> <data|control> <mensaje> | quit\n"
-                  << std::flush;
+            header.flags == DEMO_BROADCAST ? "broadcast" : "directo";
+        monitorEvent(std::string("Mensaje ") + delivery + " del nodo " +
+                     std::to_string(header.sender) + " por " + channel_name + ": " +
+                     message);
         return;
     }
 

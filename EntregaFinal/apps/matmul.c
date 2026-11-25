@@ -52,7 +52,7 @@ static void multiply_rows(const volatile double* a, const volatile double* b,
     }
 }
 
-static void coordinator(const char* path_a, const char* path_b) {
+static int coordinator(const char* path_a, const char* path_b) {
     const size_t page = dsm_page_size();
     const uint32_t workers = (uint32_t)app_node_count() - 1;
     if (workers == 0) {
@@ -113,10 +113,7 @@ static void coordinator(const char* path_a, const char* path_b) {
     free(a);
     free(b);
     free(expected);
-    if (wrong != 0) {
-        dsm_shutdown();
-        exit(1);
-    }
+    return wrong == 0 ? 0 : 1;
 }
 
 static void worker(int node_id) {
@@ -140,19 +137,30 @@ static void worker(int node_id) {
     sleep(2); /* El coordinador libera el bloque de control mientras seguimos en línea. */
 }
 
+/* Corre la aplicación en el nodo ya iniciado de este proceso. Lo usan el
+   comando run de dsmnode y el main de abajo. En el nodo 0 recibe <matriz_a> <matriz_b>. */
+int matmul_run(int node_id, int argc, char* argv[]) {
+    if (node_id == 0) {
+        if (argc < 2) {
+            fprintf(stderr, "Uso en el nodo 0: matmul <matriz_a> <matriz_b>\n");
+            return 2;
+        }
+        return coordinator(argv[0], argv[1]);
+    }
+    worker(node_id);
+    return 0;
+}
+
+#ifndef APP_NO_MAIN
 int main(int argc, char* argv[]) {
-    if (argc < 3 || (atoi(argv[2]) == 0 && argc < 5)) {
-        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> [matriz_a matriz_b (solo nodo 0)]\n",
-                argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> [<matriz_a> <matriz_b> (solo nodo 0)]\n", argv[0]);
         return 2;
     }
     const int node_id = atoi(argv[2]);
     app_check(dsm_init(argv[1], node_id), "dsm_init");
-    if (node_id == 0) {
-        coordinator(argv[3], argv[4]);
-    } else {
-        worker(node_id);
-    }
+    const int result = matmul_run(node_id, argc - 3, argv + 3);
     dsm_shutdown();
-    return 0;
+    return result;
 }
+#endif
