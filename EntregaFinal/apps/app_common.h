@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 #define APP_MAX_NODES 32
@@ -119,6 +120,22 @@ static void app_barrier(char* segment, int node_id, int nodes, uint32_t phase) {
             usleep(1000);
         }
     }
+}
+
+/* Milisegundos de un reloj monotónico, para medir las fases de las apps. */
+static double app_now_ms(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return now.tv_sec * 1000.0 + now.tv_nsec / 1e6;
+}
+
+/* Tiempos de un nodo: carga de datos al DSM (hasta la barrera 1), cálculo distribuido
+   (de la barrera 1 a la 2) y el mismo cálculo completo hecho localmente, sin DSM. */
+static void app_print_times(int node_id, double start, double loaded, double computed,
+                            double sequential) {
+    printf("Nodo %d: tiempos: carga %.1f ms, cálculo distribuido %.1f ms, "
+           "cálculo secuencial local %.1f ms\n",
+           node_id, loaded - start, computed - loaded, sequential);
 }
 
 static void app_print_stats(int node_id) {

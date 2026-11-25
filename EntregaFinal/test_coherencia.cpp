@@ -42,6 +42,20 @@ int main(int argc, char* argv[]) {
         assert(dsm_stats(0, &stats) == DSM_OK);
         assert(stats.pages_sent >= 2 && stats.pages_recv >= 2);
         waitFor(3, 1);             // El nodo 1 vio el último valor.
+
+        // Segmento de 20 páginas con 16 por nodo: no cabe en el nodo 0 (ancla, 10 % 2),
+        // que toma su final libre (páginas 2-15); las 6 restantes salen del nodo 1.
+        char* big = nullptr;
+        assert(dsm_alloc(20 * page, 10, reinterpret_cast<void**>(&big)) == DSM_OK);
+        assert(big == const_cast<char*>(shared) + 2 * page);
+        waitFor(4, 1);             // El nodo 1 escribió a ambos lados del límite.
+        assert(big[13 * page] == 'a' && big[15 * page] == 'b' && big[19 * page] == 'c');
+        dsm_page_t piece[6]{};
+        assert(dsm_page_table(1, 16, 6, piece) == 6);
+        assert(piece[0].proc_id == 10 && piece[0].order == 14 && piece[5].order == 19);
+        shared[5] = 1;
+        waitFor(6, 1);             // El nodo 1 ya no lee el segmento del proceso 8.
+        assert(dsm_free(big) == DSM_OK);
         assert(dsm_free(data) == DSM_OK);
         std::printf("test_coherencia nodo 0: OK (enviadas %u, recibidas %u)\n",
                     stats.pages_sent, stats.pages_recv);
@@ -65,6 +79,18 @@ int main(int argc, char* argv[]) {
         assert(pages[0].owner == 0);
         assert(dsm_page_table(0, 15, 2, pages) == DSM_E_INVAL);  // Fuera del rango del nodo 0.
         shared[3] = 1;
+
+        // Se une al segmento de 20 páginas que ocupa los dos nodos.
+        char* big = nullptr;
+        assert(dsm_alloc(20 * page, 10, reinterpret_cast<void**>(&big)) == DSM_OK);
+        assert(big == const_cast<char*>(shared) + 2 * page);
+        big[13 * page] = 'a';      // Página 15: home nodo 0.
+        big[15 * page] = 'b';      // Página 17: home nodo 1.
+        big[19 * page] = 'c';
+        shared[4] = 1;
+        waitFor(5, 1);
+        shared[6] = 1;
+        assert(dsm_free(big) == DSM_OK);
         dsm_stats_t stats{};
         assert(dsm_stats(1, &stats) == DSM_OK);
         assert(stats.faults >= 4 && stats.pages_recv >= 3);

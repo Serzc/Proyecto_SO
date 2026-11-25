@@ -360,11 +360,12 @@ bool Node::validMessage(const Connection& connection) const {
     case MessageType::AllocRequest:
         return header.seq != 0 && header.status == STATUS_OK &&
                header.page == PAGE_NONE &&
-               header.payload_len == ALLOC_REQUEST_SIZE;
+               (header.payload_len == ALLOC_REQUEST_SIZE ||
+                header.payload_len == ALLOC_PIECE_REQUEST_SIZE);
     case MessageType::AllocReply:
         return header.seq != 0 && header.page == PAGE_NONE &&
                ((header.status == STATUS_OK &&
-                 header.payload_len == PAGE_INDEX_SIZE) ||
+                 header.payload_len == ALLOC_REPLY_SIZE) ||
                 (header.status > STATUS_OK &&
                  header.status <= STATUS_INVALID &&
                  header.payload_len == 0));
@@ -471,26 +472,28 @@ void Node::handleMessage(Connection& connection) {
 }
 
 void Node::handleAllocRequest(const MsgHeader& request,
-                        const std::vector<std::uint8_t>& payload) {
+                              const std::vector<std::uint8_t>& payload) {
     std::uint32_t count = 0;
     std::uint32_t proc_id = 0;
+    std::uint32_t exact_first = PAGE_NONE;
+    std::uint32_t order_base = 0;
     std::uint32_t first_page = 0;
+    std::uint32_t piece = 0;
     std::uint8_t status = STATUS_INVALID;
-    if (readU32(payload, 0, count) && readU32(payload, 4, proc_id)) {
-        const int result = allocateAtHome(count, proc_id, request.sender, first_page);
+    if (readU32(payload, 0, count) && readU32(payload, 4, proc_id) &&
+        (payload.size() == ALLOC_REQUEST_SIZE ||
+         (readU32(payload, 8, exact_first) && readU32(payload, 12, order_base)))) {
+        const int result = allocateAtHome(count, proc_id, request.sender, exact_first,
+                                          order_base, first_page, piece);
         status = result == DSM_OK ? STATUS_OK
                : result == DSM_E_NOMEM ? STATUS_NO_SPACE
                                        : STATUS_INVALID;
     }
 
-    std::array<std::uint8_t, PAGE_INDEX_SIZE> response{};
-    std::size_t response_size = 0;
+    std::vector<std::uint8_t> response;
     if (status == STATUS_OK) {
-        response[0] = static_cast<std::uint8_t>((first_page >> 24) & 0xFF);
-        response[1] = static_cast<std::uint8_t>((first_page >> 16) & 0xFF);
-        response[2] = static_cast<std::uint8_t>((first_page >> 8) & 0xFF);
-        response[3] = static_cast<std::uint8_t>(first_page & 0xFF);
-        response_size = response.size();
+        appendU32(response, first_page);
+        appendU32(response, piece);
     }
     MsgHeader reply{};
     reply.type = static_cast<std::uint8_t>(MessageType::AllocReply);
@@ -498,10 +501,9 @@ void Node::handleAllocRequest(const MsgHeader& request,
     reply.seq = request.seq;
     reply.page = PAGE_NONE;
     if (!sendFrame(request.sender, Channel::Control, reply,
-                   response_size == 0 ? nullptr : response.data(),
-                   response_size) &&
+                   response.empty() ? nullptr : response.data(), response.size()) &&
         status == STATUS_OK) {
-        releaseAtHome(first_page, count, proc_id, request.sender);
+        releaseAtHome(first_page, piece, proc_id, request.sender);
     }
 }
 

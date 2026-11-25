@@ -323,114 +323,113 @@ int Node::queryLog(std::uint8_t target, std::vector<LogEntry>& out) {
     return DSM_OK;
 }
 
+// Pide una parte del segmento a un home (o la reserva aquí si el home es este nodo).
+int Node::requestPiece(std::uint8_t home, std::uint32_t count, std::uint32_t proc_id,
+                       std::uint32_t exact_first, std::uint32_t order_base,
+                       std::uint32_t& first_page, std::uint32_t& piece) {
+    if (home == node_id_) {
+        return allocateAtHome(count, proc_id, node_id_, exact_first, order_base, first_page,
+                              piece);
+    }
+    std::vector<std::uint8_t> request;
+    appendU32(request, count);
+    appendU32(request, proc_id);
+    if (exact_first != PAGE_NONE) {
+        appendU32(request, exact_first);
+        appendU32(request, order_base);
+    }
+    std::vector<std::uint8_t> response;
+    const int result = requestMessage(home, MessageType::AllocRequest, PAGE_NONE, request,
+                                      MessageType::AllocReply, response);
+    if (result == DSM_OK &&
+        (!readU32(response, 0, first_page) || !readU32(response, 4, piece))) {
+        return DSM_E_NET;
+    }
+    return result;
+}
+
+// Suelta la parte [first_page, first_page + count) en su home.
+int Node::releasePiece(std::uint32_t first_page, std::uint32_t count, std::uint32_t proc_id) {
+    const std::uint8_t home = homeOf(first_page);
+    return home == node_id_ ? releaseAtHome(first_page, count, proc_id, node_id_)
+                            : sendFreeRequest(home, first_page, count, proc_id);
+}
+
 int Node::allocate(std::size_t size, std::uint32_t proc_id, void** out) {
     if (size == 0 || proc_id == 0 || out == nullptr) {
         return DSM_E_INVAL;
     }
     const std::size_t page_size = config_.page_size;
-    const std::size_t page_count =
-        size / page_size + (size % page_size != 0 ? 1 : 0);
-    if (page_count == 0 || page_count > config_.pages_per_node ||
-        page_count > UINT32_MAX) {
+    const std::size_t page_count = size / page_size + (size % page_size != 0 ? 1 : 0);
+    if (page_count == 0) {
         return DSM_E_INVAL;
     }
+    if (page_count > page_table_.size()) {
+        return DSM_E_NOMEM;  // Más que la memoria de todo el sistema.
+    }
+    const auto total = static_cast<std::uint32_t>(page_count);
 
-    // Segmento compartido: el mismo proc da la misma región en cualquier nodo. Su
-    // home es siempre proc % nodos, así todos los nodos le piden al mismo home y
-    // ninguno tiene que crearla primero.
-    // shortcut: si ese home está lleno o caído no se intenta otro; usar otro proc.
-    const auto shared_home = static_cast<std::uint8_t>(proc_id % config_.num_hosts);
-    if (shared_home != node_id_ &&
-        nodes()[shared_home].state != static_cast<std::uint8_t>(NodeState::Online)) {
+    // Segmento compartido: el mismo proc da la misma región en cualquier nodo. Su home
+    // ancla es siempre proc % nodos, así todos le piden al mismo nodo y ninguno tiene
+    // que crearlo primero. Si el ancla no tiene lugar para todo, toma las páginas libres
+    // del final de su rango y el resto se pide a los nodos siguientes, cuyos rangos
+    // siguen en la numeración global: la dirección del segmento queda continua.
+    const auto anchor = static_cast<std::uint8_t>(proc_id % config_.num_hosts);
+    const auto node_entries = nodes();
+    const auto online = [&](std::uint8_t id) {
+        return id == node_id_ ||
+               node_entries[id].state == static_cast<std::uint8_t>(NodeState::Online);
+    };
+    if (!online(anchor)) {
         return DSM_E_NODE_DOWN;
     }
-    const std::uint8_t candidates[] = {shared_home};
 
-    int last_error = DSM_E_NOMEM;
-    for (const std::uint8_t home : candidates) {
-        std::uint32_t first_page = 0;
-        int result = DSM_OK;
-        if (home == node_id_) {
-            result = allocateAtHome(static_cast<std::uint32_t>(page_count),
-                                    proc_id, node_id_, first_page);
-        } else {
-            std::vector<std::uint8_t> request;
-            request.reserve(ALLOC_REQUEST_SIZE);
-            appendU32(request, static_cast<std::uint32_t>(page_count));
-            appendU32(request, proc_id);
-            std::vector<std::uint8_t> response;
-            result = requestMessage(home, MessageType::AllocRequest, PAGE_NONE,
-                                    request, MessageType::AllocReply,
-                                    response);
-            if (result == DSM_OK &&
-                !readU32(response, 0, first_page)) {
-                result = DSM_E_NET;
-            }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> pieces;  // (primera página, cantidad)
+    const auto rollback = [&] {
+        for (const auto& piece : pieces) {
+            releasePiece(piece.first, piece.second, proc_id);
         }
-
-        if (result == DSM_E_NOMEM) {
-            continue;
-        }
-        if (result != DSM_OK) {
-            last_error = result;
-            continue;
-        }
-
-        const auto rollback = [&] {
-            if (home == node_id_) {
-                return releaseAtHome(first_page,
-                                     static_cast<std::uint32_t>(page_count),
-                                     proc_id, node_id_);
-            }
-            return sendFreeRequest(home, first_page,
-                                   static_cast<std::uint32_t>(page_count),
-                                   proc_id);
-        };
-        const std::uint64_t offset =
-            static_cast<std::uint64_t>(first_page) * config_.page_size;
-        if (offset > UINT64_MAX - config_.dsm_base) {
-            rollback();
-            return DSM_E_INVAL;
-        }
-        const std::uint64_t address = config_.dsm_base + offset;
-        const std::uint64_t allocation_bytes =
-            static_cast<std::uint64_t>(page_count) * config_.page_size;
-        const std::uint64_t address_limit =
-            std::numeric_limits<std::uintptr_t>::max();
-        if (address > address_limit ||
-            allocation_bytes == 0 ||
-            allocation_bytes - 1 > address_limit - address) {
-            rollback();
-            return DSM_E_INVAL;
-        }
-        void* allocation_ptr =
-            reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
-        if (allocation_ptr == nullptr) {
-            rollback();
-            return DSM_E_INVAL;
-        }
-        try {
-            std::lock_guard<std::mutex> lock(allocations_mutex_);
-            const auto inserted = allocations_.emplace(
-                reinterpret_cast<std::uintptr_t>(allocation_ptr),
-                Allocation{first_page, static_cast<std::uint32_t>(page_count),
-                           proc_id});
-            // Si ya estaba, este nodo se había unido antes: es la misma referencia.
-            static_cast<void>(inserted);
-        } catch (const std::bad_alloc&) {
-            if (home == node_id_) {
-                releaseAtHome(first_page, static_cast<std::uint32_t>(page_count),
-                              proc_id, node_id_);
-            } else {
-                sendFreeRequest(home, first_page,
-                                static_cast<std::uint32_t>(page_count), proc_id);
-            }
-            throw;
-        }
-        *out = allocation_ptr;
-        return DSM_OK;
+    };
+    std::uint32_t first_page = 0;
+    std::uint32_t done = 0;
+    int result = requestPiece(anchor, total, proc_id, PAGE_NONE, 0, first_page, done);
+    if (result != DSM_OK) {
+        return result;
     }
-    return last_error;
+    pieces.emplace_back(first_page, done);
+    for (std::size_t home = anchor + 1U; done < total; ++home) {
+        if (home >= config_.num_hosts || !online(static_cast<std::uint8_t>(home))) {
+            rollback();
+            return DSM_E_NOMEM;
+        }
+        const std::uint32_t count = std::min(total - done, config_.pages_per_node);
+        const auto range_start = static_cast<std::uint32_t>(home) * config_.pages_per_node;
+        std::uint32_t piece_first = 0;
+        std::uint32_t piece = 0;
+        result = requestPiece(static_cast<std::uint8_t>(home), count, proc_id, range_start,
+                              done, piece_first, piece);
+        if (result != DSM_OK) {
+            rollback();
+            return result;
+        }
+        pieces.emplace_back(piece_first, piece);
+        done += piece;
+    }
+
+    // La región entera ya está mapeada en dsm_base, así que la dirección es válida.
+    void* allocation_ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(
+        config_.dsm_base + static_cast<std::uint64_t>(first_page) * config_.page_size));
+    try {
+        std::lock_guard<std::mutex> lock(allocations_mutex_);
+        // Si ya estaba, este nodo se había unido antes: es la misma referencia.
+        allocations_.emplace(reinterpret_cast<std::uintptr_t>(allocation_ptr),
+                             Allocation{first_page, total, proc_id});
+    } catch (const std::bad_alloc&) {
+        rollback();
+        throw;
+    }
+    *out = allocation_ptr;
+    return DSM_OK;
 }
 
 int Node::release(void* ptr) {
@@ -445,13 +444,19 @@ int Node::release(void* ptr) {
         allocation = found->second;
     }
 
-    const auto home = static_cast<std::uint8_t>(
-        allocation.first_page / config_.pages_per_node);
-    const int result = home == node_id_
-        ? releaseAtHome(allocation.first_page, allocation.num_pages,
-                        allocation.proc_id, node_id_)
-        : sendFreeRequest(home, allocation.first_page,
-                          allocation.num_pages, allocation.proc_id);
+    // El segmento puede ocupar varios nodos: se suelta la parte de cada home.
+    int result = DSM_OK;
+    const std::uint32_t end = allocation.first_page + allocation.num_pages;
+    for (std::uint32_t page = allocation.first_page; page < end;) {
+        const std::uint32_t range_end = (page / config_.pages_per_node + 1) *
+                                        config_.pages_per_node;
+        const std::uint32_t count = std::min(end, range_end) - page;
+        const int piece_result = releasePiece(page, count, allocation.proc_id);
+        if (piece_result != DSM_OK && result == DSM_OK) {
+            result = piece_result;
+        }
+        page += count;
+    }
     if (result == DSM_OK) {
         std::lock_guard<std::mutex> lock(allocations_mutex_);
         allocations_.erase(address);
@@ -459,67 +464,102 @@ int Node::release(void* ptr) {
     return result;
 }
 
-int Node::allocateAtHome(std::uint32_t count, std::uint32_t proc_id,
-                         std::uint8_t requester, std::uint32_t& first_page) {
-    if (count == 0 || count > config_.pages_per_node || proc_id == 0) {
+// Reserva, o une al solicitante a, la parte de un segmento que cae en el rango de
+// este nodo. Con exact_first == PAGE_NONE este nodo es el ancla (proc % nodos): busca
+// el segmento del proceso; si no existe lo crea entero si cabe y, si no, toma las
+// páginas libres del final de su rango (piece dice cuántas) para que el resto siga en
+// el nodo siguiente. Con exact_first es una parte de continuación: count páginas desde
+// el inicio del rango, con órdenes desde order_base.
+int Node::allocateAtHome(std::uint32_t count, std::uint32_t proc_id, std::uint8_t requester,
+                         std::uint32_t exact_first, std::uint32_t order_base,
+                         std::uint32_t& first_page, std::uint32_t& piece) {
+    const std::uint32_t range_start =
+        static_cast<std::uint32_t>(node_id_) * config_.pages_per_node;
+    const std::uint32_t range_end = range_start + config_.pages_per_node;
+    const bool continuation = exact_first != PAGE_NONE;
+    if (count == 0 || proc_id == 0 ||
+        (continuation && (exact_first != range_start || count > config_.pages_per_node))) {
         return DSM_E_INVAL;
     }
 
-    const std::uint32_t range_start =
-        static_cast<std::uint32_t>(node_id_) * config_.pages_per_node;
     std::lock_guard<std::mutex> lock(page_table_mutex_);
-    // Si el segmento del proceso ya existe, el nodo se une a él. Buscar y crear
-    // bajo el mismo mutex evita dos segmentos si dos nodos piden a la vez.
+    // Si la parte ya existe, el nodo se une. Buscar y crear bajo el mismo mutex evita
+    // dos segmentos si dos nodos piden a la vez.
     for (auto& entry : home_allocations_) {
         Allocation& existing = entry.second;
-        if (existing.proc_id == proc_id) {
-            if (existing.num_pages != count) {
-                return DSM_E_INVAL;
+        if (existing.proc_id != proc_id) {
+            continue;
+        }
+        if ((continuation ? existing.num_pages : existing.total) != count ||
+            (continuation && existing.first_page != exact_first)) {
+            return DSM_E_INVAL;
+        }
+        existing.nodes |= nodeBit(requester);
+        first_page = existing.first_page;
+        piece = existing.num_pages;
+        recordLog(LOG_JOIN, first_page, requester, 0, proc_id, NODE_NONE);
+        return DSM_OK;
+    }
+
+    std::uint32_t start = PAGE_NONE;
+    std::uint32_t length = 0;
+    if (continuation) {
+        for (std::uint32_t page = range_start; page < range_start + count; ++page) {
+            if (page_table_[page].proc_id != 0) {
+                return DSM_E_NOMEM;
             }
-            existing.nodes |= nodeBit(requester);
-            first_page = existing.first_page;
-            recordLog(LOG_JOIN, first_page, requester, 0, proc_id, NODE_NONE);
-            return DSM_OK;
+        }
+        start = range_start;
+        length = count;
+    } else {
+        std::uint32_t run = 0;
+        for (std::uint32_t page = range_start; page < range_end && count <= config_.pages_per_node;
+             ++page) {
+            run = page_table_[page].proc_id == 0 ? run + 1 : 0;
+            if (run == count) {
+                start = page + 1 - count;
+                length = count;
+                break;
+            }
+        }
+        if (start == PAGE_NONE) {
+            // No cabe entero: toma el final libre del rango si hay un nodo siguiente.
+            std::uint32_t tail = 0;
+            while (tail < config_.pages_per_node &&
+                   page_table_[range_end - 1 - tail].proc_id == 0) {
+                ++tail;
+            }
+            if (tail == 0 || node_id_ + 1U >= config_.num_hosts) {
+                return DSM_E_NOMEM;
+            }
+            start = range_end - tail;
+            length = tail;
         }
     }
-    std::uint32_t run_start = range_start;
-    std::uint32_t run_length = 0;
-    const std::uint32_t range_end = range_start + config_.pages_per_node;
-    for (std::uint32_t page = range_start; page < range_end; ++page) {
-        if (page_table_[page].proc_id == 0) {
-            if (run_length == 0) {
-                run_start = page;
-            }
-            if (++run_length == count) {
-                try {
-                    const auto inserted = home_allocations_.emplace(
-                        run_start,
-                        Allocation{run_start, count, proc_id, nodeBit(requester)});
-                    if (!inserted.second) {
-                        return DSM_E_NET;
-                    }
-                } catch (const std::bad_alloc&) {
-                    return DSM_E_NOMEM;
-                }
-                for (std::uint32_t offset = 0; offset < count; ++offset) {
-                    PageEntry& entry = page_table_[run_start + offset];
-                    entry.proc_id = proc_id;
-                    entry.copyset = std::uint32_t{1} << node_id_;
-                    entry.order = offset;
-                    entry.state = static_cast<std::uint8_t>(PageState::Invalid);
-                    entry.owner = node_id_;
-                    entry.reserved = 0;
-                }
-                node_table_.recordAllocation(node_id_, count);
-                first_page = run_start;
-                recordLog(LOG_CREATE, first_page, requester, 0, proc_id, NODE_NONE);
-                return DSM_OK;
-            }
-        } else {
-            run_length = 0;
+
+    try {
+        Allocation allocation{start, length, proc_id, nodeBit(requester)};
+        allocation.total = continuation ? length : count;
+        if (!home_allocations_.emplace(start, allocation).second) {
+            return DSM_E_NET;
         }
+    } catch (const std::bad_alloc&) {
+        return DSM_E_NOMEM;
     }
-    return DSM_E_NOMEM;
+    for (std::uint32_t offset = 0; offset < length; ++offset) {
+        PageEntry& entry = page_table_[start + offset];
+        entry.proc_id = proc_id;
+        entry.copyset = nodeBit(node_id_);
+        entry.order = order_base + offset;
+        entry.state = static_cast<std::uint8_t>(PageState::Invalid);
+        entry.owner = node_id_;
+        entry.reserved = 0;
+    }
+    node_table_.recordAllocation(node_id_, length);
+    first_page = start;
+    piece = length;
+    recordLog(LOG_CREATE, first_page, requester, 0, proc_id, NODE_NONE);
+    return DSM_OK;
 }
 
 int Node::releaseAtHome(std::uint32_t first_page, std::uint32_t count,
@@ -555,7 +595,9 @@ int Node::releaseAtHome(std::uint32_t first_page, std::uint32_t count,
         }
         for (std::uint32_t offset = 0; offset < count; ++offset) {
             const PageEntry& entry = page_table_[first_page + offset];
-            if (entry.proc_id != proc_id || entry.order != offset) {
+            // Las órdenes siguen la posición en el segmento completo.
+            if (entry.proc_id != proc_id ||
+                entry.order != page_table_[first_page].order + offset) {
                 return DSM_E_BADADDR;
             }
             copysets[offset] = entry.copyset | nodeBit(entry.owner);

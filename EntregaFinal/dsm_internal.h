@@ -57,7 +57,9 @@ constexpr std::uint8_t DEMO_BROADCAST = 1;
 constexpr std::uint8_t DEMO_UNICAST = 2;
 constexpr std::size_t MESSAGE_HEADER_SIZE = 16;
 constexpr std::size_t DEMO_MAX_BYTES = 1024;
-constexpr std::size_t ALLOC_REQUEST_SIZE = 8;
+constexpr std::size_t ALLOC_REQUEST_SIZE = 8;         // cantidad, proceso
+constexpr std::size_t ALLOC_PIECE_REQUEST_SIZE = 16;  // + primera página, orden base
+constexpr std::size_t ALLOC_REPLY_SIZE = 8;           // primera página, páginas tomadas
 constexpr std::size_t FREE_REQUEST_SIZE = 12;
 constexpr std::size_t PAGE_INDEX_SIZE = 4;
 constexpr std::uint8_t STATUS_OK = 0;
@@ -240,6 +242,7 @@ struct Allocation {
     std::uint32_t num_pages;
     std::uint32_t proc_id;
     std::uint32_t nodes = 0;  // En el home: nodos unidos al segmento (un bit por nodo).
+    std::uint32_t total = 0;  // En el ancla: páginas del segmento completo.
 };
 
 void appendU32(std::vector<std::uint8_t>& bytes, std::uint32_t value);
@@ -539,7 +542,12 @@ private:
     void handleMessage(Connection& connection);
 
     int allocateAtHome(std::uint32_t count, std::uint32_t proc_id, std::uint8_t requester,
-                       std::uint32_t& first_page);
+                       std::uint32_t exact_first, std::uint32_t order_base,
+                       std::uint32_t& first_page, std::uint32_t& piece);
+    int requestPiece(std::uint8_t home, std::uint32_t count, std::uint32_t proc_id,
+                     std::uint32_t exact_first, std::uint32_t order_base,
+                     std::uint32_t& first_page, std::uint32_t& piece);
+    int releasePiece(std::uint32_t first_page, std::uint32_t count, std::uint32_t proc_id);
 
     int releaseAtHome(std::uint32_t first_page, std::uint32_t count,
                       std::uint32_t proc_id, std::uint8_t requester);

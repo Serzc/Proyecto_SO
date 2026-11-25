@@ -85,6 +85,7 @@ int matmul_run(int node_id, int argc, char* argv[]) {
     app_wait_all_online();
     const size_t page = dsm_page_size();
     const size_t bytes = sizeof(double) * n * n;
+    const double start = app_now_ms();
     char* segment = app_join(PROC_MATMUL, nodes * page + 3 * bytes, node_id);
     if (segment == NULL) {
         free(a);
@@ -103,6 +104,7 @@ int matmul_run(int node_id, int argc, char* argv[]) {
            last, (void*)segment);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 1);
+    const double loaded = app_now_ms();
 
     shared_matrices_t shared = {shared_a, shared_b, shared_c, n};
     app_parallel(multiply_task, &shared, first, last);
@@ -110,9 +112,12 @@ int matmul_run(int node_id, int argc, char* argv[]) {
            APP_THREADS);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 2);
+    const double computed = app_now_ms();
 
     double* expected = malloc(bytes);
+    const double sequential_start = app_now_ms();
     multiply_rows(a, b, expected, n, 0, n);
+    const double sequential = app_now_ms() - sequential_start;
     uint32_t wrong = 0;
     double checksum = 0;
     for (uint32_t i = 0; i < n * n; ++i) {
@@ -124,6 +129,7 @@ int matmul_run(int node_id, int argc, char* argv[]) {
     printf("Nodo %d: verificación de C completa contra la multiplicación secuencial: "
            "%s (%u de %u celdas distintas)\n",
            node_id, wrong == 0 ? "CORRECTA" : "ERROR", wrong, n * n);
+    app_print_times(node_id, start, loaded, computed, sequential);
     app_print_stats(node_id);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 3);

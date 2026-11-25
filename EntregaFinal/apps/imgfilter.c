@@ -155,19 +155,20 @@ int imgfilter_run(int node_id, int argc, char* argv[]) {
     for (int band = 0; band <= img.nodes; ++band) {
         img.first_row[band] = (uint32_t)((uint64_t)img.height * band / img.nodes);
     }
-    /* Una banda debe caber en la memoria que aporta su home. */
+    /* La imagen (entrada RGB y salida en gris) debe caber en la memoria de todo el
+       sistema; una banda puede ocupar varios nodos si su home no tiene lugar. */
     dsm_node_t info[APP_MAX_NODES];
     app_check(dsm_nodes(info, APP_MAX_NODES), "dsm_nodes");
-    const size_t node_bytes = (size_t)info[0].num_pages * dsm_page_size();
-    const size_t band_bytes =
-        (size_t)(img.first_row[1] - img.first_row[0] + 1) * img.width * 3;
-    if (band_bytes > node_bytes) {
-        fprintf(stderr, "Cada banda de la imagen necesita %zu KB y cada nodo aporta %zu KB: "
-                        "se necesitan más nodos o una imagen más pequeña.\n",
-                band_bytes / 1024, node_bytes / 1024);
+    const size_t system_bytes = (size_t)img.nodes * info[0].num_pages * dsm_page_size();
+    const size_t image_bytes = (size_t)img.width * img.height * 4;
+    if (image_bytes > system_bytes) {
+        fprintf(stderr, "La imagen necesita %zu KB y el sistema tiene %zu KB entre todos los "
+                        "nodos: se necesitan más nodos o una imagen más pequeña.\n",
+                image_bytes / 1024, system_bytes / 1024);
         free(local);
         return 1;
     }
+    const double start = app_now_ms();
     char* control = app_join(PROC_IMG_CONTROL, img.nodes * dsm_page_size(), node_id);
     if (control == NULL) {
         free(local);
@@ -195,6 +196,7 @@ int imgfilter_run(int node_id, int argc, char* argv[]) {
            node_id, img.width, img.height, total / 1024, 2 * img.nodes + 1, first, last);
     fflush(stdout);
     app_barrier(control, node_id, img.nodes, 1);
+    const double loaded = app_now_ms();
 
     filter_job_t job = {&img, node_id};
     app_parallel(filter_task, &job, first, last);
@@ -202,26 +204,36 @@ int imgfilter_run(int node_id, int argc, char* argv[]) {
            last, APP_THREADS);
     fflush(stdout);
     app_barrier(control, node_id, img.nodes, 2);
+    const double computed = app_now_ms();
 
-    uint32_t wrong = 0;
+    const double sequential_start = app_now_ms();
+    unsigned char* expected = malloc((size_t)img.width * img.height);
+    for (uint32_t y = 0; expected != NULL && y < img.height; ++y) {
+        for (uint32_t x = 0; x < img.width; ++x) {
+            int g[3][3];
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    g[dy + 1][dx + 1] =
+                        local_gray(local, img.width, img.height, (int)x + dx, (int)y + dy);
+                }
+            }
+            expected[(size_t)y * img.width + x] = sketch(g);
+        }
+    }
+    const double sequential = app_now_ms() - sequential_start;
+    uint32_t wrong = expected == NULL ? img.width * img.height : 0;
     uint64_t checksum = 0;
-    for (int band = 0; band < img.nodes; ++band) {
+    for (int band = 0; expected != NULL && band < img.nodes; ++band) {
         for (uint32_t y = img.first_row[band]; y < img.first_row[band + 1]; ++y) {
             for (uint32_t x = 0; x < img.width; ++x) {
-                int g[3][3];
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        g[dy + 1][dx + 1] = local_gray(local, img.width, img.height,
-                                                       (int)x + dx, (int)y + dy);
-                    }
-                }
                 const unsigned char value =
                     img.output[band][(size_t)(y - img.first_row[band]) * img.width + x];
-                wrong += value != sketch(g);
+                wrong += value != expected[(size_t)y * img.width + x];
                 checksum += value;
             }
         }
     }
+    free(expected);
     char path[512];
     const char* dot = strrchr(argv[0], '.');
     const int stem = dot != NULL ? (int)(dot - argv[0]) : (int)strlen(argv[0]);
@@ -231,6 +243,7 @@ int imgfilter_run(int node_id, int argc, char* argv[]) {
            "%s (%u de %u píxeles distintos)%s%s\n",
            node_id, (unsigned long long)checksum, wrong == 0 ? "CORRECTA" : "ERROR", wrong,
            img.width * img.height, saved ? "; guardada en " : "", saved ? path : "");
+    app_print_times(node_id, start, loaded, computed, sequential);
     app_print_stats(node_id);
     fflush(stdout);
     app_barrier(control, node_id, img.nodes, 3);

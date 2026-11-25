@@ -41,6 +41,14 @@ test_memoria: test_memoria.o libdsm.a
 test_coherencia: test_coherencia.o libdsm.a
 	$(CXX) $(LDFLAGS) $^ -o $@
 
+# Texto de ~6.4 MB (el enunciado 400 veces) para wordcount: no cabe en un solo nodo.
+data/texto_grande.txt: data/enunciado_dsm.txt
+	for i in $$(seq 400); do cat $<; done > $@
+
+# Tiempos de las tres apps con 1, 2 y 3 nodos locales.
+bench: all data/texto_grande.txt
+	./bench.sh
+
 # Pruebas automáticas en una sola máquina (puertos 28500-28525).
 test: test_memoria test_coherencia
 	./test_memoria
@@ -49,4 +57,4 @@ test: test_memoria test_coherencia
 clean:
 	rm -f *.o apps/*.o libdsm.a $(PROGRAMS)
 
-.PHONY: all test clean
+.PHONY: all test bench clean

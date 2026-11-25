@@ -94,6 +94,7 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
     const int nodes = app_node_count();
     app_wait_all_online();
     const size_t page = dsm_page_size();
+    const double start = app_now_ms();
     char* segment = app_join(PROC_WORDCOUNT, nodes * page + length, node_id);
     if (segment == NULL) {
         free(local);
@@ -109,6 +110,7 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
            (unsigned long long)begin, (unsigned long long)end, (void*)segment);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 1);
+    const double loaded = app_now_ms();
 
     const int chunk = (node_id + 1) % nodes;
     count_job_t job;
@@ -132,6 +134,7 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
            chunk, APP_THREADS, (unsigned long long)partial.words);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 2);
+    const double computed = app_now_ms();
 
     result_t total;
     memset(&total, 0, sizeof(total));
@@ -144,7 +147,9 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
         }
     }
     result_t expected;
+    const double sequential_start = app_now_ms();
     count(local, 0, length, &expected);
+    const double sequential = app_now_ms() - sequential_start;
     const int ok = total.words == expected.words && total.lines == expected.lines &&
                    memcmp(total.letters, expected.letters, sizeof(total.letters)) == 0;
     printf("Nodo %d: %llu palabras, %llu líneas; letras más frecuentes:", node_id,
@@ -161,6 +166,7 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
     }
     printf("\nNodo %d: verificación contra el conteo secuencial: %s\n", node_id,
            ok ? "CORRECTA" : "ERROR");
+    app_print_times(node_id, start, loaded, computed, sequential);
     app_print_stats(node_id);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 3);

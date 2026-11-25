@@ -149,6 +149,8 @@ Los errores son negativos: `DSM_E_INVAL`, `DSM_E_CONFIG`, `DSM_E_NOMEM`, `DSM_E_
 
 Una asignación es un segmento compartido identificado por `proc`, como un segmento de `shm_open`. Su home es siempre `proc % nodos`, así que todos los nodos le piden al mismo home y ninguno tiene que crearlo primero: el home busca el segmento y crea uno nuevo solo si no existe, todo bajo el mismo mutex, de modo que dos pedidos simultáneos reciben la misma región. El home guarda en la asignación un bit por nodo unido. `dsm_free` borra el bit del nodo y libera las páginas cuando no queda ninguno, así ningún nodo pierde memoria que otro todavía lee.
 
+Si el segmento no cabe en la memoria del home ancla (`proc % nodos`), el nodo que lo pide consigue el resto en los nodos siguientes. Los rangos de páginas de los nodos son contiguos en la numeración global (el nodo k tiene las páginas `k * pages_per_node` a `(k + 1) * pages_per_node - 1`), así que el ancla toma las páginas libres del final de su rango y el segmento sigue al principio del rango del nodo siguiente, y así hasta completar el tamaño pedido. La dirección del segmento queda continua y cada parte la administra su propio home, con su directorio MSI. `ALLOC_REQUEST` tiene dos formas: la del ancla (cantidad y proceso), que responde la primera página y cuántas páginas tomó, y la de continuación (además, la primera página exacta y el orden de su primera página dentro del segmento). Los nodos que se unen después hacen los mismos pedidos y encuentran las partes ya reservadas. `dsm_free` suelta la parte de cada home. Si algún nodo siguiente no tiene lugar o está caído, se sueltan las partes ya reservadas y `dsm_alloc` devuelve `DSM_E_NOMEM`. Un pedido más grande que la memoria de todo el sistema también devuelve `DSM_E_NOMEM`.
+
 # 10. Aplicaciones de prueba
 
 No hay coordinador ni servidor: todos los nodos son iguales y ejecutan el mismo comando (`run matmul <a> <b>` o `run wordcount <archivo>`) con los mismos archivos de entrada. Las dos aplicaciones siguen el mismo esquema:
@@ -175,7 +177,29 @@ Con tres nodos en una misma computadora (`apps/local3.conf`) se obtuvo:
 | `wordcount` | 2180 palabras, 246 líneas; letras más frecuentes e = 1502, a = 1236, o = 975, s = 952, r = 782 | CORRECTA |
 | `matmul` | C[0][0] = 28.7452, C[95][95] = 4.5012, suma de C = 9787.8401 | CORRECTA (0 de 9216 celdas distintas) |
 
-Los tres nodos imprimieron los mismos resultados. En una ejecución de `matmul`, los nodos registraron 57, 63 y 49 fallos de página; el nodo 2, home del segmento, envió 103 páginas. La demostración final se hará en computadoras distintas del laboratorio, con un `dsm.conf` que liste sus direcciones IPv4.
+Los tres nodos imprimieron los mismos resultados. `test_coherencia` además reserva un segmento de 20 páginas con 16 páginas por nodo: el nodo 0 aporta las páginas 2 a 15 y el nodo 1 las 16 a 21, y los dos nodos leen y escriben a ambos lados del límite.
+
+## 11.1 Rendimiento
+
+`make bench` corre las tres aplicaciones con 1, 2 y 3 nodos en una misma computadora (un proceso por nodo, 4 MB por nodo, 4 pthreads por nodo) y cada nodo mide tres tiempos: la carga de sus datos al DSM, el cálculo distribuido (entre la primera y la segunda barrera) y el mismo cálculo completo hecho localmente sin DSM. Para un escenario con mucha memoria, `wordcount` usa `data/texto_grande.txt`, el enunciado repetido 400 veces (6.4 MB), y `imgfilter` la foto de 1280 x 1288 (6.4 MB en el DSM entre entrada y salida). La tabla resume el nodo 0 de una ejecución en una computadora con WSL2:
+
+| Aplicación | Nodos | Memoria en el DSM | Carga | Cálculo distribuido | Secuencial local | Fallos (nodo 0) |
+|---|---|---|---|---|---|---|
+| `matmul` 96 x 96 | 1 | 216 KB | 7.7 ms | 1.6 ms | 0.8 ms | 56 |
+| `matmul` 96 x 96 | 2 | 216 KB | 8.8 ms | 10.6 ms | 0.8 ms | 51 |
+| `matmul` 96 x 96 | 3 | 216 KB | 9.3 ms | 10.3 ms | 0.9 ms | 64 |
+| `wordcount` 6.4 MB | 1 | 6.4 MB | no cabe (4 MB) | | | |
+| `wordcount` 6.4 MB | 2 | 6.4 MB (4 MB en el nodo 0, 2.4 MB en el nodo 1) | 197 ms | 220 ms | 16.7 ms | 1561 |
+| `wordcount` 6.4 MB | 3 | 6.4 MB (4 MB en el nodo 1, 2.4 MB en el nodo 2) | 193 ms | 246 ms | 17.5 ms | 1044 |
+| `imgfilter` 1280 x 1288 | 1 | 6.4 MB | no cabe (4 MB) | | | |
+| `imgfilter` 1280 x 1288 | 2 | 6.4 MB | 122 ms | 19 ms | 41 ms | 1015 |
+| `imgfilter` 1280 x 1288 | 3 | 6.4 MB | 155 ms | 45 ms | 42 ms | 953 |
+
+Con un solo nodo, `wordcount` e `imgfilter` no se pueden ejecutar: necesitan 6.4 MB y un nodo aporta 4 MB. Con dos o tres nodos funcionan, y en `wordcount` el segmento del texto ocupa memoria de dos nodos.
+
+En una sola computadora el DSM no acelera el cálculo: todos los nodos comparten los mismos núcleos y cada fallo de página cuesta un viaje por TCP local, de unos 0.1 a 0.2 ms, frente a nanosegundos de un acceso a memoria. En `wordcount` cada página se lee una sola vez y casi no se reutiliza, así que el tiempo es casi todo fallos (1561 fallos en 220 ms). `imgfilter` con 2 nodos es la excepción: cada nodo filtra su banda con 4 pthreads y la mayoría de las páginas que lee son de su propia banda, así que el cálculo distribuido (19 ms) es más rápido que el secuencial de un solo hilo (41 ms). Con 3 nodos hay más bordes entre bandas y más páginas remotas, y la ventaja desaparece. En el laboratorio, con computadoras distintas, el cálculo de cada nodo usa su propio procesador, pero cada fallo cuesta un viaje por la red física; las mismas mediciones se repiten con `bench.sh` adaptando `dsm.conf`.
+
+La demostración final se hará en computadoras distintas del laboratorio, con un `dsm.conf` que liste sus direcciones IPv4.
 
 # 12. Manual de usuario
 
@@ -189,7 +213,7 @@ El archivo `README.md` tiene la tabla completa de parámetros y comandos.
 
 # 13. Limitaciones
 
-Un nodo que no responde un `INVALIDATE` se da por caído y sin copia; si solo estaba lento, la coherencia de esa página se rompe. Si el home de una página se cae, sus datos se pierden porque no hay replicación. Un acceso a una página no asignada, o cuyo home no responde, termina el proceso. La detección de lectura o escritura depende del registro de error de x86_64. Una asignación no puede superar `pages_per_node` páginas, y como el home de un segmento es siempre `proc % nodos`, si ese home está lleno o caído no se intenta otro. Las aplicaciones esperan a todos los nodos de la configuración; si una corrida se interrumpe, su segmento queda reservado hasta reiniciar los nodos. Los extras del enunciado (ejecución distribuida de procesos y redundancia ante caídas) no se implementaron.
+Un nodo que no responde un `INVALIDATE` se da por caído y sin copia; si solo estaba lento, la coherencia de esa página se rompe. Si el home de una página se cae, sus datos se pierden porque no hay replicación. Un acceso a una página no asignada, o cuyo home no responde, termina el proceso. La detección de lectura o escritura depende del registro de error de x86_64. Un segmento que no cabe en su home ancla sigue solo en los nodos siguientes (de número mayor) y no da la vuelta al nodo 0, así que un ancla cerca del último nodo tiene menos espacio para crecer; además, si el ancla no tiene páginas libres al final de su rango, el segmento no se reparte aunque haya espacio en otros nodos. Las aplicaciones esperan a todos los nodos de la configuración; si una corrida se interrumpe, su segmento queda reservado hasta reiniciar los nodos. Los extras del enunciado (ejecución distribuida de procesos y redundancia ante caídas) no se implementaron.
 
 # 14. Conclusiones
 
