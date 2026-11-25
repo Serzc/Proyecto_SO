@@ -470,6 +470,9 @@ int main(int argc, char* argv[]) {
                                      : "CAIDO"));
                         }
                     }
+                    if (dsm::monitorIsLive()) {
+                        dsm::printNodes(node, dsm::console_output_mutex);
+                    }
                     previous = current;
                 }
             }

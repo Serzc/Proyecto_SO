@@ -43,19 +43,19 @@ En cada máquina se inicia un nodo con su consola:
 Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso y las asignaciones con sus copias. Las aplicaciones corren dentro del nodo ya iniciado:
 
 ```
-run matmul                                       # en los nodos 1, 2, ... (trabajadores)
-run matmul data/matriz_a.txt data/matriz_b.txt   # en el nodo 0 (coordinador)
-run wordcount                                    # trabajadores
-run wordcount data/enunciado_dsm.txt             # coordinador
+run matmul data/matriz_a.txt data/matriz_b.txt
+run wordcount data/enunciado_dsm.txt
 ```
 
-El coordinador compara el resultado con un cálculo secuencial e imprime `CORRECTA` o `ERROR`. `quit` espera a que terminen las aplicaciones en curso.
+No hay coordinador: todos los nodos escriben el mismo comando, en cualquier orden. Cada uno carga su parte de los datos, calcula su parte leyendo lo que cargaron los demás y verifica el resultado completo contra un cálculo secuencial (`CORRECTA` o `ERROR`). Deben participar todos los nodos de `dsm.conf`. `quit` espera a que terminen las aplicaciones en curso.
 
-Las aplicaciones también existen como programas aparte que inician su propio nodo: `./matmul dsm.conf <id> [archivos]` y `./wordcount dsm.conf <id> [archivo]`.
+Las aplicaciones también existen como programas aparte que inician su propio nodo: `./matmul dsm.conf <id> <matriz_a> <matriz_b>` y `./wordcount dsm.conf <id> <archivo>`.
 
 ## Arquitectura
 
 Cada proceso que llama a `dsm_init` es un nodo par. Todos los nodos mapean el mismo rango de direcciones con `mmap`, con las páginas en `PROT_NONE`. Al tocar una página sin permiso ocurre un `SIGSEGV`. El manejador pasa la página a un hilo de fallos, que la pide por TCP a su nodo home y aplica `mprotect` según el estado MSI (I sin acceso, S lectura, M lectura y escritura). El home guarda un directorio con el dueño y las copias de cada página, invalida las copias antes de conceder escritura y recupera las páginas modificadas.
+
+`dsm_alloc(size, proc)` funciona como un segmento compartido: el mismo `proc` devuelve la misma región en cualquier nodo. Su home es `proc % nodos`, que lleva la cuenta de qué nodos están unidos, y `dsm_free` solo libera la región cuando la suelta el último.
 
 | Módulo | Contenido |
 |---|---|

@@ -80,6 +80,7 @@ extern std::mutex console_output_mutex;
 // imprimen en vivo dentro del comando monitor, para no cortar lo que se escribe.
 void monitorEvent(const std::string& text);
 void setMonitorLive(bool live);
+bool monitorIsLive();
 
 enum class Channel : std::uint8_t {
     Data = 0,
@@ -185,6 +186,7 @@ struct Allocation {
     std::uint32_t first_page;
     std::uint32_t num_pages;
     std::uint32_t proc_id;
+    std::uint32_t nodes = 0;  // En el home: nodos unidos al segmento (un bit por nodo).
 };
 
 void appendU32(std::vector<std::uint8_t>& bytes, std::uint32_t value);
@@ -481,11 +483,11 @@ private:
 
     void handleMessage(Connection& connection);
 
-    int allocateAtHome(std::uint32_t count, std::uint32_t proc_id,
+    int allocateAtHome(std::uint32_t count, std::uint32_t proc_id, std::uint8_t requester,
                        std::uint32_t& first_page);
 
     int releaseAtHome(std::uint32_t first_page, std::uint32_t count,
-                      std::uint32_t proc_id);
+                      std::uint32_t proc_id, std::uint8_t requester);
 
     void handleAllocRequest(const MsgHeader& request,
                             const std::vector<std::uint8_t>& payload);
@@ -538,7 +540,6 @@ private:
     std::mutex allocations_mutex_;
     std::unordered_map<std::uintptr_t, Allocation> allocations_;
     std::unordered_map<std::uint32_t, Allocation> home_allocations_;
-    std::atomic<std::size_t> allocation_cursor_{0};
 
     // Directorio de las páginas home: serializa grantPage y releaseAtHome.
     std::mutex directory_mutex_;

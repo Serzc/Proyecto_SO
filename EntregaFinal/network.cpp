@@ -467,7 +467,7 @@ void Node::handleAllocRequest(const MsgHeader& request,
     std::uint32_t first_page = 0;
     std::uint8_t status = STATUS_INVALID;
     if (readU32(payload, 0, count) && readU32(payload, 4, proc_id)) {
-        const int result = allocateAtHome(count, proc_id, first_page);
+        const int result = allocateAtHome(count, proc_id, request.sender, first_page);
         status = result == DSM_OK ? STATUS_OK
                : result == DSM_E_NOMEM ? STATUS_NO_SPACE
                                        : STATUS_INVALID;
@@ -491,7 +491,7 @@ void Node::handleAllocRequest(const MsgHeader& request,
                    response_size == 0 ? nullptr : response.data(),
                    response_size) &&
         status == STATUS_OK) {
-        releaseAtHome(first_page, count, proc_id);
+        releaseAtHome(first_page, count, proc_id, request.sender);
     }
 }
 
@@ -504,7 +504,7 @@ void Node::handleFreeRequest(const MsgHeader& request,
     if (readU32(payload, 0, first_page) &&
         readU32(payload, 4, count) &&
         readU32(payload, 8, proc_id) &&
-        releaseAtHome(first_page, count, proc_id) == DSM_OK) {
+        releaseAtHome(first_page, count, proc_id, request.sender) == DSM_OK) {
         status = STATUS_OK;
     }
 

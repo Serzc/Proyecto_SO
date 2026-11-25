@@ -137,8 +137,8 @@ Los mutex se toman siempre en el mismo orden: `directory_mutex_`, después `page
 |---|---|
 | `int dsm_init(const char* config, int node_id)` | Lee la configuración, reserva la región, instala el manejador y arranca los hilos |
 | `void dsm_shutdown(void)` | Detiene los hilos, restaura el manejador y libera la región |
-| `int dsm_alloc(size_t size, uint16_t proc, void** ptr)` | Reserva páginas contiguas en un home en línea, en orden rotativo |
-| `int dsm_free(void* ptr)` | Libera la asignación e invalida las copias |
+| `int dsm_alloc(size_t size, uint16_t proc, void** ptr)` | Une el nodo al segmento compartido del proceso `proc`; el mismo `proc` da la misma región en cualquier nodo |
+| `int dsm_free(void* ptr)` | Separa el nodo del segmento; el último que lo suelta lo libera e invalida las copias |
 | `int dsm_nodes(dsm_node_t* out, int max)` | Tabla de nodos |
 | `int dsm_stats(int node_id, dsm_stats_t* out)` | Estadísticas de cualquier nodo en línea |
 | `int dsm_page_table(int node_id, uint32_t first, uint32_t count, dsm_page_t* out)` | Tabla de páginas de un home, hasta 256 entradas |
@@ -147,13 +147,22 @@ Los mutex se toman siempre en el mismo orden: `directory_mutex_`, después `page
 
 Los errores son negativos: `DSM_E_INVAL`, `DSM_E_CONFIG`, `DSM_E_NOMEM`, `DSM_E_BADADDR`, `DSM_E_NODE_DOWN`, `DSM_E_TIMEOUT` y `DSM_E_NET`.
 
+Una asignación es un segmento compartido identificado por `proc`, como un segmento de `shm_open`. Su home es siempre `proc % nodos`, así que todos los nodos le piden al mismo home y ninguno tiene que crearlo primero: el home busca el segmento y crea uno nuevo solo si no existe, todo bajo el mismo mutex, de modo que dos pedidos simultáneos reciben la misma región. El home guarda en la asignación un bit por nodo unido. `dsm_free` borra el bit del nodo y libera las páginas cuando no queda ninguno, así ningún nodo pierde memoria que otro todavía lee.
+
 # 10. Aplicaciones de prueba
 
-Las dos aplicaciones siguen el mismo esquema. El nodo 0 lee los datos de un archivo, los copia al DSM y publica un bloque de control. Los demás nodos encuentran las asignaciones recorriendo las tablas de páginas de todos los homes con `dsm_page_table` (buscan el proceso y la página de orden 0) y obtienen su dirección con `dsm_page_address`. Cada trabajador calcula su parte, escribe el resultado en su propia página y marca una bandera. El coordinador espera las banderas, compara con un cálculo secuencial e imprime el veredicto. Las esperas leen una copia S local; cuando otro nodo escribe, la invalidación obliga a pedir la página de nuevo, así que no hace falta otro mecanismo de sincronización.
+No hay coordinador ni servidor: todos los nodos son iguales y ejecutan el mismo comando (`run matmul <a> <b>` o `run wordcount <archivo>`) con los mismos archivos de entrada. Las dos aplicaciones siguen el mismo esquema:
 
-`wordcount` cuenta palabras, líneas y letras de un texto. Cada trabajador recibe un tramo de bytes; una palabra cuenta en el tramo donde empieza, aunque para saberlo lea el byte anterior en otra página. El archivo de prueba es el enunciado del proyecto en texto plano (`data/enunciado_dsm.txt`, 15 905 bytes).
+1. Cada nodo se une al segmento compartido de la aplicación con `dsm_alloc`. Las primeras páginas del segmento son de control, una por nodo.
+2. Cada nodo copia al segmento su parte de los datos de entrada.
+3. Barrera: cada nodo anota la fase en su página de control y espera a que todos los nodos lleguen. La espera lee copias S locales; cuando otro nodo escribe su fase, la invalidación obliga a pedir la página otra vez, así que no hace falta otro mecanismo de sincronización.
+4. Cada nodo calcula su parte leyendo datos que cargaron otros nodos y deja el resultado en el segmento.
+5. Barrera. Cada nodo lee el resultado completo, lo compara con un cálculo secuencial hecho con su copia local de los archivos e imprime el veredicto. Todos imprimen lo mismo.
+6. Barrera final y `dsm_free`; el último nodo en salir libera el segmento.
 
-`matmul` calcula C = A × B con matrices leídas de archivo (`data/matriz_a.txt` y `data/matriz_b.txt`, 96 × 96). A y B se comparten en modo S. Cada trabajador escribe un bloque de filas de C; los bloques que comparten una página obligan a invalidaciones y write-back entre trabajadores, lo que ejercita la coherencia.
+`wordcount` cuenta palabras, líneas y letras de un texto. Cada nodo carga su tramo de bytes y cuenta el tramo que cargó el nodo siguiente, así siempre lee páginas escritas por otro. Una palabra cuenta en el tramo donde empieza, aunque para saberlo lea el byte anterior en otra página. El archivo de prueba es el enunciado del proyecto en texto plano (`data/enunciado_dsm.txt`, 15 905 bytes).
+
+`matmul` calcula C = A × B con matrices leídas de archivo (`data/matriz_a.txt` y `data/matriz_b.txt`, 96 × 96). Cada nodo carga su bloque de filas de A y de B y calcula su bloque de filas de C. Para eso lee B completa, así que trae por la red las filas que cargaron los demás. Los bloques de C que comparten una página obligan a invalidaciones y write-back entre nodos, lo que ejercita la coherencia.
 
 # 11. Pruebas y resultados
 
@@ -166,21 +175,21 @@ Con tres nodos en una misma computadora (`apps/local3.conf`) se obtuvo:
 | `wordcount` | 2180 palabras, 246 líneas; letras más frecuentes e = 1502, a = 1236, o = 975, s = 952, r = 782 | CORRECTA |
 | `matmul` | C[0][0] = 28.7452, C[95][95] = 4.5012, suma de C = 9787.8401 | CORRECTA (0 de 9216 celdas distintas) |
 
-En una ejecución de `matmul`, el coordinador registró 59 fallos, 55 páginas enviadas y 23 recibidas, y cada trabajador 39 fallos. La demostración final se hará en computadoras distintas del laboratorio, con un `dsm.conf` que liste sus direcciones IPv4.
+Los tres nodos imprimieron los mismos resultados. En una ejecución de `matmul`, los nodos registraron 57, 63 y 49 fallos de página; el nodo 2, home del segmento, envió 103 páginas. La demostración final se hará en computadoras distintas del laboratorio, con un `dsm.conf` que liste sus direcciones IPv4.
 
 # 12. Manual de usuario
 
-1. Copiar la carpeta `Entrega Final` en cada máquina y ejecutar `make`.
+1. Copiar la carpeta `EntregaFinal` en cada máquina y ejecutar `make`.
 2. Editar `dsm.conf` con la IPv4 de cada máquina, en el mismo orden en todas, y abrir los puertos `port_base` a `port_base + 3n - 1`.
-3. En cada máquina, iniciar el programa con su `node_id`: `./dsmnode dsm.conf k` para la consola, o una aplicación.
-4. Para `wordcount`, iniciar `./wordcount dsm.conf k` en los nodos 1 en adelante y `./wordcount dsm.conf 0 data/enunciado_dsm.txt` en el nodo 0. Para `matmul`, lo mismo con `./matmul dsm.conf 0 data/matriz_a.txt data/matriz_b.txt` en el nodo 0.
-5. Desde una consola `dsmnode`, `stats` muestra las estadísticas de todo el sistema y `pages k` la tabla de páginas del nodo k. `nodes` muestra qué nodos están en línea.
+3. En cada máquina, iniciar el nodo con su `node_id`: `./dsmnode dsm.conf k`.
+4. En la consola de cada nodo, escribir el mismo comando: `run matmul data/matriz_a.txt data/matriz_b.txt` o `run wordcount data/enunciado_dsm.txt`. Deben participar todos los nodos de `dsm.conf`.
+5. `stats` muestra las estadísticas de todo el sistema. `pages` abre una vista por nodo (flechas para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso y las asignaciones. `monitor` muestra los mensajes recibidos y los cambios de estado de los nodos sin interrumpir la consola (Enter para salir). `nodes` muestra qué nodos están en línea.
 
 El archivo `README.md` tiene la tabla completa de parámetros y comandos.
 
 # 13. Limitaciones
 
-Un nodo que no responde un `INVALIDATE` se da por caído y sin copia; si solo estaba lento, la coherencia de esa página se rompe. Si el home de una página se cae, sus datos se pierden porque no hay replicación. Un acceso a una página no asignada, o cuyo home no responde, termina el proceso. La detección de lectura o escritura depende del registro de error de x86_64. Una asignación no puede superar `pages_per_node` páginas. Los extras del enunciado (ejecución distribuida de procesos y redundancia ante caídas) no se implementaron.
+Un nodo que no responde un `INVALIDATE` se da por caído y sin copia; si solo estaba lento, la coherencia de esa página se rompe. Si el home de una página se cae, sus datos se pierden porque no hay replicación. Un acceso a una página no asignada, o cuyo home no responde, termina el proceso. La detección de lectura o escritura depende del registro de error de x86_64. Una asignación no puede superar `pages_per_node` páginas, y como el home de un segmento es siempre `proc % nodos`, si ese home está lleno o caído no se intenta otro. Las aplicaciones esperan a todos los nodos de la configuración; si una corrida se interrumpe, su segmento queda reservado hasta reiniciar los nodos. Los extras del enunciado (ejecución distribuida de procesos y redundancia ante caídas) no se implementaron.
 
 # 14. Conclusiones
 
@@ -188,7 +197,9 @@ El DSM cumple con lo pedido en el enunciado: memoria reservada con `mmap`, prote
 
 La decisión que más influyó en el diseño fue no esperar nunca a la red desde el hilo que recibe las respuestas. Separar el hilo de servicio y el hilo de fallos evitó interbloqueos sin agregar timeouts artificiales. La otra decisión importante fue mantener el manejador de señales mínimo: un pipe y un contador atómico bastan para sacar el trabajo del contexto de la señal.
 
-El costo del DSM se ve en los contadores: en `matmul`, cada página de C que dos trabajadores comparten viaja varias veces entre nodos. Asignar a cada trabajador bloques alineados a página reduciría ese tráfico.
+Las aplicaciones no tienen coordinador: los segmentos compartidos con conteo de nodos unidos y las barreras sobre páginas de control bastan para que nodos iguales cooperen sin que ninguno tenga un papel especial.
+
+El costo del DSM se ve en los contadores: en `matmul`, cada página de C que dos nodos comparten viaja varias veces entre ellos. Asignar a cada nodo bloques alineados a página reduciría ese tráfico.
 
 # Bibliografía
 

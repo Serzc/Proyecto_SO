@@ -1,6 +1,6 @@
 // Prueba de coherencia MSI entre dos procesos (nodos 0 y 1 de test_coherencia.conf).
 // Uso: ./test_coherencia 0 & sleep 1; ./test_coherencia 1
-// El nodo 0 arranca primero y asigna en su propio rango, así la región empieza en
+// El proceso 8 tiene su segmento en el nodo 0 (8 % 2), así la región empieza en
 // dsm_base y el nodo 1 la encuentra sin consultar la tabla de páginas.
 #include "dsm.h"
 #include <cassert>
@@ -27,7 +27,7 @@ int main(int argc, char* argv[]) {
 
     if (node == 0) {
         void* data = nullptr;
-        assert(dsm_alloc(2 * page, 7, &data) == DSM_OK);
+        assert(dsm_alloc(2 * page, 8, &data) == DSM_OK);
         assert(data == const_cast<char*>(shared));
         shared[100] = 42;          // M en el home.
         shared[page + 5] = 9;      // Segunda página.
@@ -61,7 +61,7 @@ int main(int argc, char* argv[]) {
         assert(home.total_pages == 16 && home.free_pages == 14);
         dsm_page_t pages[2]{};
         assert(dsm_page_table(0, 0, 2, pages) == 2);
-        assert(pages[0].proc_id == 7 && pages[1].proc_id == 7 && pages[1].order == 1);
+        assert(pages[0].proc_id == 8 && pages[1].proc_id == 8 && pages[1].order == 1);
         assert(pages[0].owner == 0);
         assert(dsm_page_table(0, 15, 2, pages) == DSM_E_INVAL);  // Fuera del rango del nodo 0.
         shared[3] = 1;

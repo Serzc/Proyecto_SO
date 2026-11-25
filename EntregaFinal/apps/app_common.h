@@ -48,47 +48,32 @@ static void app_wait_all_online(void) {
     }
 }
 
-/* Busca en las tablas de páginas de todos los nodos la asignación del proceso
-   proc (la página con orden 0) y devuelve su dirección, o NULL si no existe. */
-static void* app_find(uint16_t proc) {
-    dsm_node_t nodes[APP_MAX_NODES];
-    const int count = dsm_nodes(nodes, APP_MAX_NODES);
-    app_check(count, "dsm_nodes");
-    dsm_page_t pages[256];
-    for (int n = 0; n < count; ++n) {
-        if (nodes[n].state != 1) {
-            continue;
-        }
-        for (uint32_t first = 0; first < nodes[n].num_pages; first += 256) {
-            uint32_t chunk = nodes[n].num_pages - first;
-            chunk = chunk > 256 ? 256 : chunk;
-            if (dsm_page_table(n, nodes[n].first_page + first, chunk, pages) < 0) {
-                break;
-            }
-            for (uint32_t i = 0; i < chunk; ++i) {
-                if (pages[i].proc_id == proc && pages[i].order == 0) {
-                    return dsm_page_address(nodes[n].first_page + first + i);
-                }
-            }
-        }
+/* Une este nodo al segmento compartido del proceso proc. Todos los nodos piden el
+   mismo tamaño y reciben la misma dirección; nadie lo crea ni es su dueño. Las
+   primeras `nodes` páginas son de control, una por nodo (fase y resultados).
+   Devuelve NULL si el segmento quedó de una corrida interrumpida. */
+static char* app_join(uint16_t proc, size_t bytes, int node_id) {
+    char* segment = NULL;
+    app_check(dsm_alloc(bytes, proc, (void**)&segment), "dsm_alloc");
+    if (*(volatile uint32_t*)(segment + node_id * dsm_page_size()) != 0) {
+        fprintf(stderr, "El segmento del proceso %u quedó de una corrida anterior "
+                        "interrumpida; reinicie los nodos.\n", proc);
+        dsm_free(segment);
+        return NULL;
     }
-    return NULL;
+    return segment;
 }
 
-/* Espera hasta que otro nodo publique la asignación del proceso proc. */
-static void* app_wait_find(uint16_t proc) {
-    void* address;
-    while ((address = app_find(proc)) == NULL) {
-        usleep(200 * 1000);
-    }
-    return address;
-}
-
-/* Espera a que una variable compartida tome un valor. La lectura usa la copia S
-   local; cuando otro nodo escribe, la invalidación obliga a pedir la página nueva. */
-static void app_wait_value(volatile uint32_t* value, uint32_t expected) {
-    while (*value != expected) {
-        usleep(1000);
+/* Barrera sin coordinador: el nodo anota que llegó a `phase` en su página de
+   control y espera a que todos lleguen. La espera lee copias S locales; cuando
+   otro nodo escribe su fase, la invalidación obliga a pedir la página nueva. */
+static void app_barrier(char* segment, int node_id, int nodes, uint32_t phase) {
+    const size_t page = dsm_page_size();
+    *(volatile uint32_t*)(segment + node_id * page) = phase;
+    for (int n = 0; n < nodes; ++n) {
+        while (*(volatile uint32_t*)(segment + n * page) < phase) {
+            usleep(1000);
+        }
     }
 }
 
