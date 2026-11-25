@@ -40,16 +40,19 @@ En cada máquina se inicia un nodo con su consola:
 ./dsmnode dsm.conf <id>
 ```
 
-Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso y las asignaciones con sus copias. Las aplicaciones corren dentro del nodo ya iniciado:
+Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso, las asignaciones con sus copias y el log de solicitudes que ese nodo atendió como home (quién pidió qué página, qué se concedió, a quién se invalidó y de quién vino el write-back). La vista se redibuja sola cuando algo cambia. Las aplicaciones corren dentro del nodo ya iniciado:
 
 ```
 run matmul data/matriz_a.txt data/matriz_b.txt
 run wordcount data/enunciado_dsm.txt
+run imgfilter data/aldrin.ppm
 ```
 
 No hay coordinador: todos los nodos escriben el mismo comando, en cualquier orden. Cada uno carga su parte de los datos, calcula su parte leyendo lo que cargaron los demás y verifica el resultado completo contra un cálculo secuencial (`CORRECTA` o `ERROR`). Deben participar todos los nodos de `dsm.conf`. `quit` espera a que terminen las aplicaciones en curso.
 
-Las aplicaciones también existen como programas aparte que inician su propio nodo: `./matmul dsm.conf <id> <matriz_a> <matriz_b>` y `./wordcount dsm.conf <id> <archivo>`.
+`imgfilter` convierte una foto (PPM P6) a un dibujo a lápiz en blanco y negro: escala de grises y bordes con Sobel. Cada nodo guarda la imagen como un segmento por banda de filas, con su home en nodos distintos, así que la foto de prueba (1280x1288, 6.4 MB en el DSM entre entrada y salida) no cabe en la memoria de un solo nodo; necesita `pages_per_node = 1024` y al menos dos nodos. Cada nodo escribe el resultado en `data/aldrin_lapiz_n<id>.pgm`. Otras fotos se convierten a PPM con cualquier editor o con `convert foto.jpg foto.ppm` (ImageMagick). La foto de prueba es "Aldrin Apollo 11" de la NASA, de dominio público (Wikimedia Commons).
+
+Las aplicaciones también existen como programas aparte que inician su propio nodo: `./matmul dsm.conf <id> <matriz_a> <matriz_b>`, `./wordcount dsm.conf <id> <archivo>` e `./imgfilter dsm.conf <id> <imagen.ppm>`.
 
 ## Arquitectura
 

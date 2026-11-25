@@ -5,11 +5,55 @@
 #define _DEFAULT_SOURCE /* usleep con -std=c11 */
 
 #include "../dsm.h"
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 
 #define APP_MAX_NODES 32
+#define APP_THREADS 4 /* pthreads de trabajo por nodo */
+
+/* Trabajo sobre un rango [begin, end); thread va de 0 a APP_THREADS - 1. */
+typedef void (*app_range_fn)(void* context, uint64_t begin, uint64_t end, int thread);
+
+typedef struct {
+    app_range_fn fn;
+    void* context;
+    uint64_t begin;
+    uint64_t end;
+    int thread;
+} app_task_t;
+
+static void* app_task_main(void* argument) {
+    app_task_t* task = argument;
+    task->fn(task->context, task->begin, task->end, task->thread);
+    return NULL;
+}
+
+/* Reparte [begin, end) entre APP_THREADS pthreads de este nodo. Los hilos leen y
+   escriben el DSM a la vez, así que sus fallos de página llegan concurrentes al
+   hilo de fallos del nodo. Si un pthread no se puede crear, ese tramo corre aquí. */
+static void app_parallel(app_range_fn fn, void* context, uint64_t begin, uint64_t end) {
+    pthread_t threads[APP_THREADS];
+    app_task_t tasks[APP_THREADS];
+    int created[APP_THREADS];
+    for (int i = 0; i < APP_THREADS; ++i) {
+        tasks[i].fn = fn;
+        tasks[i].context = context;
+        tasks[i].begin = begin + (end - begin) * i / APP_THREADS;
+        tasks[i].end = begin + (end - begin) * (i + 1) / APP_THREADS;
+        tasks[i].thread = i;
+        created[i] = pthread_create(&threads[i], NULL, app_task_main, &tasks[i]) == 0;
+        if (!created[i]) {
+            app_task_main(&tasks[i]);
+        }
+    }
+    for (int i = 0; i < APP_THREADS; ++i) {
+        if (created[i]) {
+            pthread_join(threads[i], NULL);
+        }
+    }
+}
 
 /* Termina con un mensaje si una llamada al DSM falla.
    shortcut: dentro de dsmnode (run) esto cierra también la consola; devolver el error

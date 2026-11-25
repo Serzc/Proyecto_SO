@@ -212,6 +212,16 @@ void Node::setLocalState(std::uint32_t page, PageState next, bool fault) {
 }
 
 bool Node::resolveFault(std::uint32_t page, bool write_access) {
+    {
+        // Varios hilos pueden fallar en la misma página antes de que se atienda el
+        // primer fallo. Si la página ya tiene el permiso, el reintento basta: pedirla
+        // otra vez haría que el home mande su copia y pise lo ya escrito.
+        std::lock_guard<std::mutex> lock(page_table_mutex_);
+        const auto state = static_cast<PageState>(page_table_[page].state);
+        if (state == PageState::Modified || (state == PageState::Shared && !write_access)) {
+            return true;
+        }
+    }
     const std::uint8_t home = homeOf(page);
     if (home == node_id_) {
         return grantPage(page, node_id_, write_access, nullptr) == DSM_OK;
@@ -250,13 +260,14 @@ bool Node::resolveFault(std::uint32_t page, bool write_access) {
 // nunca se llama desde el hilo de red.
 int Node::grantPage(std::uint32_t page, std::uint8_t requester, bool write_access,
               std::vector<std::uint8_t>* data) {
-    std::lock_guard<std::mutex> directory(directory_mutex_);
+    SemaphoreLock directory(directory_sem_);
     std::uint32_t copyset = 0;
     std::uint8_t owner = NODE_NONE;
     {
         std::lock_guard<std::mutex> lock(page_table_mutex_);
         const PageEntry& entry = page_table_[page];
         if (entry.proc_id == 0) {
+            recordLog(LOG_DENIED, page, requester, write_access ? 1 : 0, 0, NODE_NONE);
             return DSM_E_BADADDR;
         }
         copyset = entry.copyset;
@@ -266,8 +277,12 @@ int Node::grantPage(std::uint32_t page, std::uint8_t requester, bool write_acces
     // Si otro nodo tiene la página en M, se recupera su contenido antes.
     // Si el dueño es quien pide, perdió su copia sin escribirla (ver
     // REQUEST_INVALIDATED) y la copia del home sigue vigente.
+    std::uint32_t invalidated = 0;
+    std::uint8_t write_back = NODE_NONE;
     if (owner != node_id_ && owner != requester) {
         revokeCopy(page, owner);
+        invalidated |= nodeBit(owner);
+        write_back = owner;
     }
     if (owner != node_id_) {
         copyset &= ~nodeBit(owner);
@@ -280,6 +295,7 @@ int Node::grantPage(std::uint32_t page, std::uint8_t requester, bool write_acces
             if (peer == requester || (copyset & nodeBit(peer)) == 0) {
                 continue;
             }
+            invalidated |= nodeBit(peer);
             if (peer == node_id_) {
                 std::lock_guard<std::mutex> lock(page_table_mutex_);
                 setLocalState(page, PageState::Invalid, false);
@@ -309,6 +325,9 @@ int Node::grantPage(std::uint32_t page, std::uint8_t requester, bool write_acces
             node_table_.recordTransfer(node_id_, true);
         }
     }
+    recordLog(LOG_PAGE, page, requester,
+              static_cast<std::uint8_t>(write_access ? PageState::Modified : PageState::Shared),
+              invalidated, write_back);
     return DSM_OK;
 }
 

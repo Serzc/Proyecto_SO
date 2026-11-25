@@ -6,7 +6,7 @@ CFLAGS ?= -std=c11 -O2 -Wall -Wextra
 LDFLAGS ?= -pthread
 
 LIB_OBJS = config.o protocol.o node.o network.o pager.o dsm.o
-PROGRAMS = dsmnode wordcount matmul test_memoria test_coherencia
+PROGRAMS = dsmnode wordcount matmul imgfilter test_memoria test_coherencia
 
 all: $(PROGRAMS)
 
@@ -23,10 +23,13 @@ apps/%.o: apps/%.c apps/app_common.h dsm.h
 apps/%_lib.o: apps/%.c apps/app_common.h dsm.h
 	$(CC) $(CFLAGS) -DAPP_NO_MAIN -c $< -o $@
 
-dsmnode: main.o apps/wordcount_lib.o apps/matmul_lib.o libdsm.a
+dsmnode: main.o apps/wordcount_lib.o apps/matmul_lib.o apps/imgfilter_lib.o libdsm.a
 	$(CXX) $(LDFLAGS) $^ -o $@
 
 wordcount: apps/wordcount.o libdsm.a
+	$(CXX) $(LDFLAGS) $^ -o $@
+
+imgfilter: apps/imgfilter.o libdsm.a
 	$(CXX) $(LDFLAGS) $^ -o $@
 
 matmul: apps/matmul.o libdsm.a

@@ -69,6 +69,16 @@ void Node::handleQuery(const MsgHeader& request, const std::vector<std::uint8_t>
               own.pages_i, own.faults, own.pages_sent, own.pages_recv}) {
             appendU32(data, value);
         }
+    } else if (valid && kind == QUERY_LOG) {
+        for (const LogEntry& entry : localLog()) {
+            appendU32(data, entry.time);
+            appendU32(data, entry.page);
+            appendU32(data, entry.value);
+            data.push_back(entry.kind);
+            data.push_back(entry.node);
+            data.push_back(entry.result);
+            data.push_back(entry.extra);
+        }
     } else if (valid && kind == QUERY_PAGES && count > 0 && count <= QUERY_MAX) {
         std::vector<PageEntry> pages(count);
         valid = copyPageTable(node_id_, first_page, count, pages.data());
@@ -541,7 +551,7 @@ void Node::completePending(const MsgHeader& response,
                 ? DSM_E_INVAL
                 : DSM_E_NET;
     pending->complete = true;
-    pending->ready.notify_one();
+    sem_post(&pending->ready);
 }
 
 void Node::failPendingRequests() {
@@ -549,7 +559,7 @@ void Node::failPendingRequests() {
     for (auto& entry : pending_) {
         entry.second->result = DSM_E_NET;
         entry.second->complete = true;
-        entry.second->ready.notify_one();
+        sem_post(&entry.second->ready);
     }
 }
 
@@ -588,19 +598,29 @@ int Node::requestMessage(std::uint8_t target, MessageType type, std::uint32_t pa
     const bool sent = sendFrame(
         target, Channel::Control, request,
         payload.empty() ? nullptr : payload.data(), payload.size());
-    std::unique_lock<std::mutex> lock(pending_mutex_);
     if (!sent) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_.erase(pending->seq);
         return DSM_E_NODE_DOWN;
     }
-    const bool completed = pending->ready.wait_for(
-        lock, std::chrono::milliseconds(config_.timeout_ms),
-        [&] { return pending->complete || !running_; });
+    // Espera en el semáforo POSIX de la solicitud: el hilo de red hace sem_post al
+    // recibir la respuesta, y failPendingRequests al detener el nodo.
+    timespec deadline{};
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += static_cast<time_t>(config_.timeout_ms / 1000);
+    deadline.tv_nsec += static_cast<long>(config_.timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (sem_timedwait(&pending->ready, &deadline) != 0 && errno == EINTR) {
+    }
+    std::lock_guard<std::mutex> lock(pending_mutex_);
     const auto found = pending_.find(pending->seq);
     if (found != pending_.end()) {
         pending_.erase(found);
     }
-    if (!completed || !pending->complete) {
+    if (!pending->complete) {
         return running_ ? DSM_E_TIMEOUT : DSM_E_NET;
     }
     response_payload = std::move(pending->payload);

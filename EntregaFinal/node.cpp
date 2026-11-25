@@ -54,6 +54,7 @@ void setMonitorLive(bool live) {
 Node::Node(Config config, std::uint8_t node_id)
     : config_(config), node_id_(node_id),
       node_table_(config.num_hosts, node_id, config.pages_per_node) {
+    sem_init(&directory_sem_, 0, 1);
     if (node_id_ >= config_.num_hosts) {
         throw std::invalid_argument("node_id no pertenece a la configuración");
     }
@@ -92,6 +93,7 @@ Node::Node(Config config, std::uint8_t node_id)
 
 Node::~Node() {
     stop();
+    sem_destroy(&directory_sem_);
 }
 
 void Node::start() {
@@ -269,6 +271,58 @@ std::uint8_t Node::nodeId() const {
     return node_id_;
 }
 
+// Anota en el log del home una solicitud atendida (ver LogEntry).
+void Node::recordLog(LogKind kind, std::uint32_t page, std::uint8_t node,
+                     std::uint8_t result, std::uint32_t value, std::uint8_t extra) {
+    LogEntry entry{};
+    entry.time = static_cast<std::uint32_t>(std::time(nullptr));
+    entry.page = page;
+    entry.value = value;
+    entry.kind = static_cast<std::uint8_t>(kind);
+    entry.node = node;
+    entry.result = result;
+    entry.extra = extra;
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    log_.push_back(entry);
+    if (log_.size() > LOG_CAPACITY) {
+        log_.pop_front();
+    }
+}
+
+std::vector<LogEntry> Node::localLog() const {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    return std::vector<LogEntry>(log_.begin(), log_.end());
+}
+
+// Log de solicitudes de cualquier nodo: el local se lee directo, el remoto con QUERY_LOG.
+int Node::queryLog(std::uint8_t target, std::vector<LogEntry>& out) {
+    if (target == node_id_) {
+        out = localLog();
+        return DSM_OK;
+    }
+    std::vector<std::uint8_t> reply;
+    const int result = remoteQuery(target, QUERY_LOG, 0, 0, reply);
+    if (result != DSM_OK) {
+        return result;
+    }
+    if (reply.size() % LOG_ENTRY_SIZE != 0) {
+        return DSM_E_NET;
+    }
+    out.assign(reply.size() / LOG_ENTRY_SIZE, LogEntry{});
+    for (std::size_t index = 0; index < out.size(); ++index) {
+        const std::size_t at = index * LOG_ENTRY_SIZE;
+        LogEntry& entry = out[index];
+        readU32(reply, at, entry.time);
+        readU32(reply, at + 4, entry.page);
+        readU32(reply, at + 8, entry.value);
+        entry.kind = reply[at + 12];
+        entry.node = reply[at + 13];
+        entry.result = reply[at + 14];
+        entry.extra = reply[at + 15];
+    }
+    return DSM_OK;
+}
+
 int Node::allocate(std::size_t size, std::uint32_t proc_id, void** out) {
     if (size == 0 || proc_id == 0 || out == nullptr) {
         return DSM_E_INVAL;
@@ -424,6 +478,7 @@ int Node::allocateAtHome(std::uint32_t count, std::uint32_t proc_id,
             }
             existing.nodes |= nodeBit(requester);
             first_page = existing.first_page;
+            recordLog(LOG_JOIN, first_page, requester, 0, proc_id, NODE_NONE);
             return DSM_OK;
         }
     }
@@ -457,6 +512,7 @@ int Node::allocateAtHome(std::uint32_t count, std::uint32_t proc_id,
                 }
                 node_table_.recordAllocation(node_id_, count);
                 first_page = run_start;
+                recordLog(LOG_CREATE, first_page, requester, 0, proc_id, NODE_NONE);
                 return DSM_OK;
             }
         } else {
@@ -479,7 +535,7 @@ int Node::releaseAtHome(std::uint32_t first_page, std::uint32_t count,
     // Las copias remotas se invalidan antes de liberar; por eso esta función
     // puede esperar a la red y no se llama desde el hilo de red (salvo el
     // rollback de handleAllocRequest, cuyas páginas no tienen copias remotas).
-    std::lock_guard<std::mutex> directory(directory_mutex_);
+    SemaphoreLock directory(directory_sem_);
     std::vector<std::uint32_t> copysets(count);
     {
         std::lock_guard<std::mutex> lock(page_table_mutex_);
@@ -494,6 +550,7 @@ int Node::releaseAtHome(std::uint32_t first_page, std::uint32_t count,
         // ningún nodo pierde memoria que todavía está leyendo.
         allocation->second.nodes &= ~nodeBit(requester);
         if (allocation->second.nodes != 0) {
+            recordLog(LOG_LEAVE, first_page, requester, 0, proc_id, NODE_NONE);
             return DSM_OK;
         }
         for (std::uint32_t offset = 0; offset < count; ++offset) {
@@ -533,6 +590,7 @@ int Node::releaseAtHome(std::uint32_t first_page, std::uint32_t count,
     }
     home_allocations_.erase(allocation);
     node_table_.recordFree(node_id_, count);
+    recordLog(LOG_RELEASE, first_page, requester, 0, proc_id, NODE_NONE);
     return DSM_OK;
 }
 

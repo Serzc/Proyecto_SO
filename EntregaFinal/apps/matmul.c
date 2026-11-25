@@ -49,6 +49,20 @@ static void multiply_rows(const volatile double* a, const volatile double* b,
     }
 }
 
+typedef struct {
+    const double* a;
+    const double* b;
+    double* c;
+    uint32_t n;
+} shared_matrices_t;
+
+/* Tarea de un pthread: filas [begin, end) de C sobre las matrices compartidas. */
+static void multiply_task(void* context, uint64_t begin, uint64_t end, int thread) {
+    (void)thread;
+    const shared_matrices_t* m = context;
+    multiply_rows(m->a, m->b, m->c, m->n, (uint32_t)begin, (uint32_t)end);
+}
+
 /* Corre la aplicación en el nodo ya iniciado de este proceso. La usan el comando
    run de dsmnode y el main de abajo. */
 int matmul_run(int node_id, int argc, char* argv[]) {
@@ -90,8 +104,10 @@ int matmul_run(int node_id, int argc, char* argv[]) {
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 1);
 
-    multiply_rows(shared_a, shared_b, shared_c, n, first, last);
-    printf("Nodo %d: filas [%u, %u) de C calculadas.\n", node_id, first, last);
+    shared_matrices_t shared = {shared_a, shared_b, shared_c, n};
+    app_parallel(multiply_task, &shared, first, last);
+    printf("Nodo %d: filas [%u, %u) de C calculadas con %d pthreads.\n", node_id, first, last,
+           APP_THREADS);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 2);
 
@@ -112,7 +128,7 @@ int matmul_run(int node_id, int argc, char* argv[]) {
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 3);
 
-    app_check(dsm_free(segment), "dsm_free");
+    dsm_free(segment); /* Si su home ya terminó, esa memoria ya no existe: no es un error. */
     free(a);
     free(b);
     free(expected);

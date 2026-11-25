@@ -67,6 +67,17 @@ static char* read_file(const char* path, uint64_t* length) {
     return data;
 }
 
+typedef struct {
+    const char* text;
+    result_t results[APP_THREADS];
+} count_job_t;
+
+/* Tarea de un pthread: cuenta su pedazo del tramo en su propio resultado. */
+static void count_task(void* context, uint64_t begin, uint64_t end, int thread) {
+    count_job_t* job = context;
+    count(job->text, begin, end, &job->results[thread]);
+}
+
 /* Corre la aplicación en el nodo ya iniciado de este proceso. La usan el comando
    run de dsmnode y el main de abajo. */
 int wordcount_run(int node_id, int argc, char* argv[]) {
@@ -100,14 +111,25 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
     app_barrier(segment, node_id, nodes, 1);
 
     const int chunk = (node_id + 1) % nodes;
+    count_job_t job;
+    memset(&job, 0, sizeof(job));
+    job.text = text;
+    app_parallel(count_task, &job, length * chunk / nodes, length * (chunk + 1) / nodes);
     result_t partial;
-    count(text, length * chunk / nodes, length * (chunk + 1) / nodes, &partial);
+    memset(&partial, 0, sizeof(partial));
+    for (int t = 0; t < APP_THREADS; ++t) {
+        partial.words += job.results[t].words;
+        partial.lines += job.results[t].lines;
+        for (int l = 0; l < 26; ++l) {
+            partial.letters[l] += job.results[t].letters[l];
+        }
+    }
     mine->chunk = (uint32_t)chunk;
     mine->words = partial.words;
     mine->lines = partial.lines;
     memcpy(mine->letters, partial.letters, sizeof(partial.letters));
-    printf("Nodo %d: contó el tramo del nodo %d: %llu palabras.\n", node_id, chunk,
-           (unsigned long long)partial.words);
+    printf("Nodo %d: contó el tramo del nodo %d con %d pthreads: %llu palabras.\n", node_id,
+           chunk, APP_THREADS, (unsigned long long)partial.words);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 2);
 
@@ -143,7 +165,7 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 3);
 
-    app_check(dsm_free(segment), "dsm_free");
+    dsm_free(segment); /* Si su home ya terminó, esa memoria ya no existe: no es un error. */
     free(local);
     return ok ? 0 : 1;
 }

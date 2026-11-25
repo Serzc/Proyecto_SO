@@ -33,7 +33,9 @@ void printHelp() {
                  "  stats                             estadísticas de todos los nodos\n"
                  "  pages                             vista de páginas por nodo (flechas, q sale)\n"
                  "  pages <node_id>                   lista las páginas asignadas en ese home\n"
-                 "  run <wordcount|matmul> [args]     corre una aplicación en este nodo\n"
+                 "  run <app> <archivos>              corre una aplicación en este nodo:\n"
+                 "                                      wordcount <texto>, matmul <a> <b>,\n"
+                 "                                      imgfilter <imagen.ppm>\n"
                  "  monitor                           mensajes recibidos y cambios de nodos (Enter sale)\n"
                  "  send <id> <data|control> <texto>  mensaje de prueba a un nodo\n"
                  "  broadcast <data|control> <texto>  mensaje de prueba a todos\n"
@@ -93,18 +95,23 @@ struct HomeAllocation {
     std::uint32_t owners = 0;             // Nodos con alguna página en M.
 };
 
-// Pinta una vista de páginas del nodo target. Requiere console_output_mutex.
-void renderPagesView(Node& node, std::uint8_t target) {
+// Arma la pantalla de la vista de páginas del nodo target (no la imprime).
+std::string renderPagesView(Node& node, std::uint8_t target) {
+    char* buffer = nullptr;
+    std::size_t length = 0;
+    FILE* out = open_memstream(&buffer, &length);
+    if (out == nullptr) {
+        return "No hay memoria para la vista.\n";
+    }
     const auto entries = node.nodes();
     const NodeInfo& info = entries[target];
     const Config& config = node.config();
     const bool online = info.state == static_cast<std::uint8_t>(NodeState::Online);
 
-    std::printf("\033[2J\033[H");  // Limpia la pantalla.
-    std::printf("Páginas del nodo %u (nodos 0 a %zu)   (<- -> cambia de nodo, q o Enter sale; "
-                "se actualiza cada segundo)\n",
+    std::fprintf(out, "Páginas del nodo %u (nodos 0 a %zu)   (<- -> cambia de nodo, q o Enter sale; "
+                "se actualiza con cada cambio)\n",
                 static_cast<unsigned int>(target), entries.size() - 1);
-    std::printf("Estado: %s   Host: %s   Rango: páginas %u a %u\n\n",
+    std::fprintf(out, "Estado: %s   Host: %s   Rango: páginas %u a %u\n\n",
                 online ? "EN LINEA" : "CAIDO", config.hosts[target], info.first_page,
                 info.first_page + info.num_pages - 1);
     NodeStats stats{};
@@ -112,18 +119,20 @@ void renderPagesView(Node& node, std::uint8_t target) {
     const int result = online ? node.queryStats(target, stats) : DSM_E_NODE_DOWN;
     const int pages_result = result == DSM_OK ? fetchHomePages(node, info, pages) : result;
     if (pages_result != DSM_OK) {
-        std::printf("Sin datos: %s\n", dsm_strerror(pages_result));
-        std::fflush(stdout);
-        return;
+        std::fprintf(out, "Sin datos: %s\n", dsm_strerror(pages_result));
+        std::fclose(out);
+        const std::string screen(buffer, length);
+        std::free(buffer);
+        return screen;
     }
 
     const std::uint32_t used = stats.total_pages - stats.free_pages;
-    std::printf("Memoria que aporta: %u páginas de %u bytes; %u usadas, %u libres (%u%% en uso)\n",
+    std::fprintf(out, "Memoria que aporta: %u páginas de %u bytes; %u usadas, %u libres (%u%% en uso)\n",
                 stats.total_pages, config.page_size, used, stats.free_pages,
                 stats.total_pages == 0 ? 0U : 100U * used / stats.total_pages);
-    std::printf("Copias que tiene de todo el DSM: M %u, S %u, I %u\n", stats.pages_m,
+    std::fprintf(out, "Copias que tiene de todo el DSM: M %u, S %u, I %u\n", stats.pages_m,
                 stats.pages_s, stats.pages_i);
-    std::printf("Fallos atendidos %u, páginas enviadas %u, recibidas %u\n\n", stats.faults,
+    std::fprintf(out, "Fallos atendidos %u, páginas enviadas %u, recibidas %u\n\n", stats.faults,
                 stats.pages_sent, stats.pages_recv);
 
     // Agrupa las páginas en asignaciones y asigna una letra por proceso para el mapa.
@@ -158,14 +167,14 @@ void renderPagesView(Node& node, std::uint8_t target) {
         map[index] = position < 26 ? static_cast<char>('A' + position) : '#';
     }
 
-    std::printf("Mapa (cada carácter es una página: . libre, letra = proceso):\n");
+    std::fprintf(out, "Mapa (cada carácter es una página: . libre, letra = proceso):\n");
     for (std::size_t row = 0; row < map.size(); row += 64) {
-        std::printf("%6zu  %s\n", info.first_page + row, map.substr(row, 64).c_str());
+        std::fprintf(out, "%6zu  %s\n", info.first_page + row, map.substr(row, 64).c_str());
     }
 
-    std::printf("\nAsignaciones (%zu):\n", allocations.size());
+    std::fprintf(out, "\nAsignaciones (%zu):\n", allocations.size());
     if (!allocations.empty()) {
-        std::printf("  Proc  Letra      Páginas   Cant  Dirección        Home I/S/M  "
+        std::fprintf(out, "  Proc  Letra      Páginas   Cant  Dirección        Home I/S/M  "
                     "Copias en  Escritor\n");
     }
     for (const HomeAllocation& allocation : allocations) {
@@ -176,7 +185,7 @@ void renderPagesView(Node& node, std::uint8_t target) {
         const std::string states = std::to_string(allocation.states[0]) + "/" +
                                    std::to_string(allocation.states[1]) + "/" +
                                    std::to_string(allocation.states[2]);
-        std::printf("%6u  %5c  %11s  %5u  0x%012llx  %11s  %-9s  %s\n", allocation.proc_id,
+        std::fprintf(out, "%6u  %5c  %11s  %5u  0x%012llx  %11s  %-9s  %s\n", allocation.proc_id,
                     letter < 26 ? static_cast<char>('A' + letter) : '#', range.c_str(),
                     allocation.count,
                     static_cast<unsigned long long>(
@@ -186,7 +195,65 @@ void renderPagesView(Node& node, std::uint8_t target) {
                     allocation.owners == 0 ? "home"
                                            : nodeList(allocation.owners, entries.size()).c_str());
     }
-    std::fflush(stdout);
+
+    // Log del home: solicitudes recibidas y lo que concedió, más recientes primero.
+    std::vector<LogEntry> log;
+    const int log_result = node.queryLog(target, log);
+    std::fprintf(out, "\nSolicitudes atendidas como home (más recientes primero):\n");
+    if (log_result != DSM_OK) {
+        std::fprintf(out, "  sin respuesta: %s\n", dsm_strerror(log_result));
+    } else if (log.empty()) {
+        std::fprintf(out, "  (ninguna)\n");
+    }
+    const std::size_t shown = std::min<std::size_t>(log.size(), 12);
+    for (std::size_t index = 0; index < shown; ++index) {
+        const LogEntry& entry = log[log.size() - 1 - index];
+        char stamp[16] = "--:--:--";
+        const std::time_t when = entry.time;
+        std::tm local{};
+        if (localtime_r(&when, &local) != nullptr) {
+            std::strftime(stamp, sizeof(stamp), "%H:%M:%S", &local);
+        }
+        std::fprintf(out, "  %s  nodo %-2u ", stamp, static_cast<unsigned int>(entry.node));
+        switch (entry.kind) {
+        case LOG_PAGE: {
+            const bool write = entry.result == static_cast<std::uint8_t>(PageState::Modified);
+            std::fprintf(out, "pág %-5u %s: concedida %s", entry.page,
+                         write ? "escritura" : "lectura  ", write ? "M" : "S");
+            if (entry.value != 0) {
+                std::fprintf(out, "; invalidó %s", nodeList(entry.value, entries.size()).c_str());
+            }
+            if (entry.extra != NODE_NONE) {
+                std::fprintf(out, "; write-back de %u", static_cast<unsigned int>(entry.extra));
+            }
+            break;
+        }
+        case LOG_DENIED:
+            std::fprintf(out, "pág %-5u %s: rechazada (no asignada)", entry.page,
+                         entry.result != 0 ? "escritura" : "lectura  ");
+            break;
+        case LOG_CREATE:
+            std::fprintf(out, "creó el segmento del proceso %u (desde la pág %u)", entry.value,
+                         entry.page);
+            break;
+        case LOG_JOIN:
+            std::fprintf(out, "se unió al segmento del proceso %u", entry.value);
+            break;
+        case LOG_LEAVE:
+            std::fprintf(out, "soltó el segmento del proceso %u", entry.value);
+            break;
+        case LOG_RELEASE:
+            std::fprintf(out, "soltó el segmento del proceso %u; páginas liberadas", entry.value);
+            break;
+        default:
+            std::fprintf(out, "evento desconocido %u", static_cast<unsigned int>(entry.kind));
+        }
+        std::fprintf(out, "\n");
+    }
+    std::fclose(out);
+    const std::string screen(buffer, length);
+    std::free(buffer);
+    return screen;
 }
 
 // Vista interactiva de páginas: flechas izquierda/derecha cambian de nodo.
@@ -202,14 +269,19 @@ void pagesView(Node& node) {
     }
     const auto node_count = static_cast<int>(node.nodes().size());
     int target = node.nodeId();
+    std::string shown;
     while (true) {
-        {
+        // Consulta cada 250 ms y redibuja solo si algo cambió, sin parpadeo.
+        const std::string screen = renderPagesView(node, static_cast<std::uint8_t>(target));
+        if (screen != shown) {
             std::lock_guard<std::mutex> lock(console_output_mutex);
-            renderPagesView(node, static_cast<std::uint8_t>(target));
+            std::printf("\033[2J\033[H%s", screen.c_str());
+            std::fflush(stdout);
+            shown = screen;
         }
         pollfd input{STDIN_FILENO, POLLIN, 0};
-        if (poll(&input, 1, 1000) == 0) {
-            continue;  // Sin teclas: refresca.
+        if (poll(&input, 1, 250) == 0) {
+            continue;
         }
         const int key = std::cin.get();
         if (key == EOF || key == 'q' || key == '\n') {
@@ -400,6 +472,7 @@ bool handleDemoCommand(const Node& node, const std::string& command) {
 
 extern "C" int wordcount_run(int node_id, int argc, char* argv[]);
 extern "C" int matmul_run(int node_id, int argc, char* argv[]);
+extern "C" int imgfilter_run(int node_id, int argc, char* argv[]);
 
 // run <app> [argumentos]: corre la aplicación en un hilo de este nodo, sin
 // detenerlo; la consola sigue disponible mientras tanto.
@@ -410,10 +483,11 @@ void runApp(dsm::Node& node, const std::string& command) {
     input >> word >> app;
     int (*entry)(int, int, char**) = app == "wordcount" ? wordcount_run
                                    : app == "matmul"    ? matmul_run
+                                   : app == "imgfilter" ? imgfilter_run
                                                         : nullptr;
     if (entry == nullptr) {
         std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
-        std::cout << "Uso: run <wordcount|matmul> [argumentos]\n" << std::flush;
+        std::cout << "Uso: run <wordcount|matmul|imgfilter> <archivos>\n" << std::flush;
         return;
     }
     std::vector<std::string> args;

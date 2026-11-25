@@ -35,6 +35,7 @@
 #include <utility>
 #include <vector>
 #include <csignal>
+#include <semaphore.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -68,6 +69,9 @@ constexpr std::uint32_t QUERY_PAGES = 1;
 constexpr std::size_t QUERY_REQUEST_SIZE = 12;
 constexpr std::size_t QUERY_STATS_SIZE = 32;
 constexpr std::size_t QUERY_PAGE_ENTRY_SIZE = 16;
+constexpr std::uint32_t QUERY_LOG = 2;
+constexpr std::size_t LOG_ENTRY_SIZE = 16;  // Igual que una entrada de página: QUERY_REPLY ya lo acepta.
+constexpr std::size_t LOG_CAPACITY = 64;
 constexpr std::uint8_t REQUEST_NONE = 0;
 constexpr std::uint8_t REQUEST_ACTIVE = 1;
 constexpr std::uint8_t REQUEST_INVALIDATED = 2;
@@ -171,8 +175,35 @@ struct QueryReq {
 };
 static_assert(sizeof(QueryReq) == 12, "QueryReq debe ocupar 12 bytes");
 
+// Semáforo POSIX binario usado como candado (sem_wait / sem_post), con RAII.
+class SemaphoreLock {
+public:
+    explicit SemaphoreLock(sem_t& semaphore) : semaphore_(semaphore) {
+        while (sem_wait(&semaphore_) != 0 && errno == EINTR) {
+        }
+    }
+    ~SemaphoreLock() {
+        sem_post(&semaphore_);
+    }
+    SemaphoreLock(const SemaphoreLock&) = delete;
+    SemaphoreLock& operator=(const SemaphoreLock&) = delete;
+
+private:
+    sem_t& semaphore_;
+};
+
+// Solicitud que espera respuesta. El hilo que pidió espera en ready (sem_timedwait)
+// y el hilo de red lo despierta con sem_post al recibir la respuesta.
 struct Pending {
-    std::condition_variable ready;
+    Pending() {
+        sem_init(&ready, 0, 0);
+    }
+    ~Pending() {
+        sem_destroy(&ready);
+    }
+    Pending(const Pending&) = delete;
+    Pending& operator=(const Pending&) = delete;
+    sem_t ready;
     std::uint32_t seq;
     std::uint8_t dest;
     std::uint8_t response_type;
@@ -180,6 +211,28 @@ struct Pending {
     bool complete = false;
     int result = DSM_E_NET;
     std::vector<std::uint8_t> payload;
+};
+
+// Solicitudes que el home anota en su log.
+enum LogKind : std::uint8_t {
+    LOG_PAGE = 1,     // PAGE_REQUEST (o fallo local) concedido: result = S o M.
+    LOG_DENIED = 2,   // PAGE_REQUEST rechazado (página no asignada): result = 1 si escritura.
+    LOG_CREATE = 3,   // Segmento creado: page = primera página, value = proceso.
+    LOG_JOIN = 4,     // Nodo unido a un segmento existente.
+    LOG_LEAVE = 5,    // Nodo soltó el segmento; quedan otros unidos.
+    LOG_RELEASE = 6   // El último nodo lo soltó: páginas liberadas.
+};
+
+// Entrada del log (16 bytes en QUERY_REPLY). En LOG_PAGE, value = nodos invalidados
+// y extra = nodo que devolvió la página en M (write-back) o NODE_NONE.
+struct LogEntry {
+    std::uint32_t time;  // Segundos desde 1970 en el reloj del home.
+    std::uint32_t page;
+    std::uint32_t value;
+    std::uint8_t kind;
+    std::uint8_t node;   // Nodo que hizo la solicitud.
+    std::uint8_t result;
+    std::uint8_t extra;
 };
 
 struct Allocation {
@@ -407,6 +460,8 @@ public:
 
     int queryStats(std::uint8_t target, NodeStats& out);
 
+    int queryLog(std::uint8_t target, std::vector<LogEntry>& out);
+    std::vector<LogEntry> localLog() const;
     int queryPageTable(std::uint8_t target, std::uint32_t first_page,
                        std::uint32_t count, std::vector<PageEntry>& out);
 
@@ -541,8 +596,14 @@ private:
     std::unordered_map<std::uintptr_t, Allocation> allocations_;
     std::unordered_map<std::uint32_t, Allocation> home_allocations_;
 
-    // Directorio de las páginas home: serializa grantPage y releaseAtHome.
-    std::mutex directory_mutex_;
+    // Semáforo POSIX binario (iniciado en 1 en el constructor) que protege el estado
+    // MSI y la lista de copias de las páginas home durante grantPage y releaseAtHome.
+    sem_t directory_sem_;
+    // Últimas solicitudes atendidas como home (ver recordLog).
+    mutable std::mutex log_mutex_;
+    std::deque<LogEntry> log_;
+    void recordLog(LogKind kind, std::uint32_t page, std::uint8_t node, std::uint8_t result,
+                   std::uint32_t value, std::uint8_t extra);
     // Por página: si el hilo de fallos espera PAGE_DATA (REQUEST_*).
     std::vector<std::uint8_t> request_state_;
     struct ServiceJob {

@@ -6,3 +6,5 @@ wordcount
 matmul
 test_memoria
 test_coherencia
+data/*_lapiz_n*.pgm
+imgfilter
