@@ -65,6 +65,9 @@ constexpr std::size_t PAGE_INDEX_SIZE = 4;
 constexpr std::uint8_t STATUS_OK = 0;
 constexpr std::uint8_t STATUS_NO_SPACE = 1;
 constexpr std::uint8_t STATUS_INVALID = 2;
+// JOIN: dsm_base, page_size, pages_per_node, heartbeat_ms, timeout_ms y
+// port_base|num_hosts (7 x 4 bytes), seguido de la IPv4 de cada host.
+constexpr std::uint32_t JOIN_FIXED_SIZE = 28;
 constexpr std::size_t CHANNEL_COUNT = 3;
 constexpr std::uint32_t QUERY_STATS = 0;
 constexpr std::uint32_t QUERY_PAGES = 1;
@@ -322,6 +325,13 @@ public:
         return true;
     }
 
+    void markOffline(std::uint8_t node_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (node_id < node_count_ && node_id != local_node_id_) {
+            entries_[node_id].state = static_cast<std::uint8_t>(NodeState::Offline);
+        }
+    }
+
     void markTimedOut(std::chrono::milliseconds timeout) {
         const auto now = Clock::now();
         std::lock_guard<std::mutex> lock(mutex_);
@@ -576,6 +586,7 @@ private:
                         std::uint32_t count, std::uint32_t proc_id);
 
     void joinLoop();
+    std::vector<std::uint8_t> joinPayload() const;
 
     bool sendFrame(std::uint8_t target_id, Channel channel, MsgHeader header,
                    const std::uint8_t* payload, std::size_t payload_size) const;
@@ -602,6 +613,8 @@ private:
     std::vector<std::thread> user_threads_;
     std::mutex user_threads_mutex_;
     std::array<bool, MAX_NODES> joined_{};
+    // Nodos cuyo JOIN trajo una configuración distinta: se ignoran sus frames.
+    std::array<std::atomic<bool>, MAX_NODES> config_mismatch_{};
     std::mutex pending_mutex_;
     std::unordered_map<std::uint32_t, std::shared_ptr<Pending>> pending_;
     std::mutex allocations_mutex_;

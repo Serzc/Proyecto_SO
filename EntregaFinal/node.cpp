@@ -139,6 +139,30 @@ void Node::start() {
 }
 
 void Node::stop() {
+    // Un home no sale mientras otros nodos en línea siguen unidos a sus segmentos:
+    // sus páginas solo existen aquí. Espera como máximo timeout_ms.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.timeout_ms);
+    while (running_ && std::chrono::steady_clock::now() < deadline) {
+        std::uint32_t online = 0;
+        for (const NodeInfo& info : node_table_.snapshot()) {
+            if (info.node_id != node_id_ &&
+                info.state == static_cast<std::uint8_t>(NodeState::Online)) {
+                online |= nodeBit(info.node_id);
+            }
+        }
+        bool attached = false;
+        {
+            std::lock_guard<std::mutex> lock(page_table_mutex_);
+            for (const auto& entry : home_allocations_) {
+                attached = attached || (entry.second.nodes & online) != 0;
+            }
+        }
+        if (!attached) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
     running_ = false;
     failPendingRequests();
     stopService();
@@ -596,6 +620,39 @@ int Node::releaseAtHome(std::uint32_t first_page, std::uint32_t count,
         allocation->second.nodes &= ~nodeBit(requester);
         if (allocation->second.nodes != 0) {
             recordLog(LOG_LEAVE, first_page, requester, 0, proc_id, NODE_NONE);
+            if (requester == node_id_) {
+                return DSM_OK;  // Las páginas del home ya están en su memoria.
+            }
+            for (std::uint32_t offset = 0; offset < count; ++offset) {
+                const PageEntry& entry = page_table_[first_page + offset];
+                copysets[offset] = entry.copyset | (entry.owner == requester
+                                                        ? nodeBit(requester) : 0);
+            }
+        }
+    }
+    if (copysets.size() == count && std::any_of(copysets.begin(), copysets.end(),
+                                                [](std::uint32_t set) { return set != 0; })) {
+        // El nodo que se separa puede salir del sistema después: el home recupera
+        // sus copias (con write-back si estaban en M) para que los demás las lean.
+        for (std::uint32_t offset = 0; offset < count; ++offset) {
+            if ((copysets[offset] & nodeBit(requester)) == 0) {
+                continue;
+            }
+            const std::uint32_t page = first_page + offset;
+            revokeCopy(page, requester);
+            std::lock_guard<std::mutex> lock(page_table_mutex_);
+            PageEntry& entry = page_table_[page];
+            entry.copyset &= ~nodeBit(requester);
+            if (entry.owner == requester) {
+                entry.owner = node_id_;
+            }
+        }
+        return DSM_OK;
+    }
+    {
+        std::lock_guard<std::mutex> lock(page_table_mutex_);
+        const auto allocation = home_allocations_.find(first_page);
+        if (allocation == home_allocations_.end() || allocation->second.nodes != 0) {
             return DSM_OK;
         }
         for (std::uint32_t offset = 0; offset < count; ++offset) {

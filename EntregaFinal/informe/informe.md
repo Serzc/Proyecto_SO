@@ -10,6 +10,8 @@ Cada proceso que llama a `dsm_init` es un nodo par; no hay un servidor central. 
 
 Cada nodo abre tres puertos TCP: datos (`port_base + 3k`), control (`port_base + 3k + 1`) y heartbeat (`port_base + 3k + 2`). Las operaciones del DSM viajan por el puerto de control; el de heartbeat solo lleva los latidos que marcan a cada nodo EN LÍNEA o CAÍDO.
 
+Al arrancar, cada nodo envía `JOIN` a todos los demás con los parámetros de su `dsm.conf`: `dsm_base`, `page_size`, `pages_per_node`, `heartbeat_ms`, `timeout_ms`, `port_base`, la cantidad de hosts y la IPv4 de cada host, que es también la memoria que aporta cada nodo y dónde está. El que lo recibe lo compara con su propia configuración, como se diseñó en el Entregable 1. Si algo no coincide, responde `JOIN_ACK` con estado inválido, marca al nodo como CAÍDO, ignora todos sus mensajes y lo anuncia en `monitor` ("el nodo 2 tiene un dsm.conf distinto"). Así una máquina con otra configuración no puede calcular homes o rangos distintos y corromper la memoria. Si ese nodo se reinicia con la configuración correcta, su nuevo `JOIN` lo acepta.
+
 ![Figura 1. Arquitectura de un nodo y sus hilos.](figures/arquitectura-mermaid.png){width=85%}
 
 La Figura 1 muestra los hilos de un nodo. Los hilos de la aplicación usan punteros DSM como memoria normal. Un acceso sin permiso produce `SIGSEGV`; el manejador pasa la página al hilo de fallos, que la resuelve con el home y cambia la protección. El hilo de red atiende los mensajes entrantes, y el hilo de servicio ejecuta las solicitudes que necesitan esperar a otros nodos.
@@ -94,7 +96,7 @@ Cada frame es un encabezado de 16 bytes seguido de la carga. Los campos se codif
 
 | Tipo | Código | Dirección | Carga |
 |---|---|---|---|
-| `JOIN` / `JOIN_ACK` | 1 / 2 | nodo nuevo <-> cada par | ninguna |
+| `JOIN` / `JOIN_ACK` | 1 / 2 | nodo nuevo <-> cada par | 28 bytes de parámetros de `dsm.conf` y 4 bytes por host (IPv4) / ninguna; estado inválido si la configuración no coincide |
 | `HEARTBEAT` | 3 | todos <-> todos (puerto heartbeat) | ninguna |
 | `PAGE_REQUEST` | 4 | solicitante -> home | 4 bytes: 0 lectura, 1 escritura |
 | `PAGE_DATA` | 5 | home -> solicitante | página completa, o estado inválido sin carga |
@@ -148,7 +150,7 @@ Los mutex se toman siempre en el mismo orden: `directory_mutex_`, después `page
 
 Los errores son negativos: `DSM_E_INVAL`, `DSM_E_CONFIG`, `DSM_E_NOMEM`, `DSM_E_BADADDR`, `DSM_E_NODE_DOWN`, `DSM_E_TIMEOUT` y `DSM_E_NET`.
 
-Una asignación es un segmento compartido identificado por `proc`, como un segmento de `shm_open`. Su home es siempre `proc % nodos`, así que todos los nodos le piden al mismo home y ninguno tiene que crearlo primero: el home busca el segmento y crea uno nuevo solo si no existe, todo bajo el mismo mutex, de modo que dos pedidos simultáneos reciben la misma región. El home guarda en la asignación un bit por nodo unido. `dsm_free` borra el bit del nodo y libera las páginas cuando no queda ninguno, así ningún nodo pierde memoria que otro todavía lee.
+Una asignación es un segmento compartido identificado por `proc`, como un segmento de `shm_open`. Su home es siempre `proc % nodos`, así que todos los nodos le piden al mismo home y ninguno tiene que crearlo primero: el home busca el segmento y crea uno nuevo solo si no existe, todo bajo el mismo mutex, de modo que dos pedidos simultáneos reciben la misma región. El home guarda en la asignación un bit por nodo unido. `dsm_free` borra el bit del nodo y libera las páginas cuando no queda ninguno, así ningún nodo pierde memoria que otro todavía lee. Si quedan otros nodos unidos, el home antes recupera las copias del nodo que se separa (con write-back de las que tenía en M), porque ese nodo puede salir del sistema y sus páginas tienen que seguir disponibles. Por la misma razón `dsm_shutdown` espera, hasta `timeout_ms`, a que ningún nodo en línea siga unido a un segmento cuyo home es el nodo que sale.
 
 Si el segmento no cabe en la memoria del home ancla (`proc % nodos`), el nodo que lo pide consigue el resto en los nodos siguientes. Los rangos de páginas de los nodos son contiguos en la numeración global (el nodo k tiene las páginas `k * pages_per_node` a `(k + 1) * pages_per_node - 1`), así que el ancla toma las páginas libres del final de su rango y el segmento sigue al principio del rango del nodo siguiente, y así hasta completar el tamaño pedido. La dirección del segmento queda continua y cada parte la administra su propio home, con su directorio MSI. `ALLOC_REQUEST` tiene dos formas: la del ancla (cantidad y proceso), que responde la primera página y cuántas páginas tomó, y la de continuación (además, la primera página exacta y el orden de su primera página dentro del segmento). Los nodos que se unen después hacen los mismos pedidos y encuentran las partes ya reservadas. `dsm_free` suelta la parte de cada home. Si algún nodo siguiente no tiene lugar o está caído, se sueltan las partes ya reservadas y `dsm_alloc` devuelve `DSM_E_NOMEM`. Un pedido más grande que la memoria de todo el sistema también devuelve `DSM_E_NOMEM`.
 
@@ -215,7 +217,7 @@ La demostración final se hará en computadoras distintas del laboratorio, con u
 2. Editar `dsm.conf` con la IPv4 de cada máquina, en el mismo orden en todas, y abrir los puertos `port_base` a `port_base + 3n - 1`.
 3. En cada máquina, iniciar el nodo con su `node_id`: `./dsmnode dsm.conf k`.
 4. En la consola de un solo nodo, el que tiene los archivos, escribir `run matmul data/matriz_a.txt data/matriz_b.txt`, `run wordcount data/enunciado_dsm.txt` o `run imgfilter data/aldrin.ppm`. Los demás nodos la ejecutan solos y el resultado queda en `output/` del nodo origen. Deben estar en línea todos los nodos de `dsm.conf`.
-5. `stats` muestra las estadísticas de todo el sistema. `pages` abre una vista por nodo (flechas para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso y las asignaciones. `monitor` muestra los mensajes recibidos y los cambios de estado de los nodos sin interrumpir la consola (Enter para salir). `nodes` muestra qué nodos están en línea.
+5. `stats` muestra las estadísticas de todo el sistema. `pages` abre una vista por nodo (flechas para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso, las asignaciones y el log de solicitudes. `pages <id>` lista las páginas asignadas de un home y `pages all` la tabla de páginas de todo el sistema en una sola consulta: home, página, dirección, proceso, orden, dueño, estado y copias. `monitor` muestra los mensajes recibidos y los cambios de estado de los nodos sin interrumpir la consola (Enter para salir). `nodes` muestra qué nodos están en línea.
 
 El archivo `README.md` tiene la tabla completa de parámetros y comandos.
 

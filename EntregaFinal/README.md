@@ -33,6 +33,8 @@ Todas las máquinas usan el mismo archivo. El orden de las líneas `host` define
 
 Para varios nodos en una sola máquina se repite `127.0.0.1` (ejemplo: `apps/local3.conf`).
 
+El `JOIN` de cada nodo lleva estos parámetros y la lista de hosts. Un nodo con un `dsm.conf` distinto es rechazado: queda CAIDO para los demás y `monitor` lo avisa.
+
 ## Ejecutar
 
 En cada máquina se inicia un nodo con su consola:
@@ -41,7 +43,7 @@ En cada máquina se inicia un nodo con su consola:
 ./dsmnode dsm.conf <id>
 ```
 
-Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso, las asignaciones con sus copias y el log de solicitudes que ese nodo atendió como home (quién pidió qué página, qué se concedió, a quién se invalidó y de quién vino el write-back). La vista se redibuja sola cuando algo cambia.
+Comandos: `nodes`, `stats`, `pages <id>`, `pages all` (tabla de páginas de todo el sistema), `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso, las asignaciones con sus copias y el log de solicitudes que ese nodo atendió como home (quién pidió qué página, qué se concedió, a quién se invalidó y de quién vino el write-back). La vista se redibuja sola cuando algo cambia.
 
 Las aplicaciones se lanzan desde la consola de **un solo nodo**, el que tiene los archivos de entrada; los demás nodos no escriben nada:
 

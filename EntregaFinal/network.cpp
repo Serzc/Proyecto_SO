@@ -331,6 +331,30 @@ bool Node::readMessage(Connection& connection, short events) {
         }
     }
 
+    const std::uint8_t sender = connection.header.sender;
+    if (connection.header.type == static_cast<std::uint8_t>(MessageType::Join)) {
+        const bool matches = connection.payload == joinPayload();
+        if (!matches && !config_mismatch_[sender].exchange(true)) {
+            monitorEvent("El nodo " + std::to_string(sender) +
+                         " tiene un dsm.conf distinto: se rechaza su JOIN");
+        } else if (matches && config_mismatch_[sender].exchange(false)) {
+            monitorEvent("El nodo " + std::to_string(sender) +
+                         " ahora tiene la misma configuración");
+        }
+        if (!matches) {
+            MsgHeader reply{};
+            reply.type = static_cast<std::uint8_t>(MessageType::JoinAck);
+            reply.status = STATUS_INVALID;
+            reply.seq = connection.header.seq;
+            reply.page = PAGE_NONE;
+            sendFrame(sender, Channel::Control, reply, nullptr, 0);
+            node_table_.markOffline(sender);
+            return false;
+        }
+    } else if (config_mismatch_[sender]) {
+        return false;
+    }
+
     if (!node_table_.recordContact(connection.header.sender,
                                    connection.peer_ipv4)) {
         return false;
@@ -365,7 +389,9 @@ bool Node::validMessage(const Connection& connection) const {
     case MessageType::Join:
         return header.seq != 0 && header.status == STATUS_OK &&
                header.page == PAGE_NONE &&
-               header.payload_len == 0;
+               header.payload_len >= JOIN_FIXED_SIZE &&
+               header.payload_len <= JOIN_FIXED_SIZE + 4 * MAX_NODES &&
+               header.payload_len % 4 == 0;
     case MessageType::JoinAck:
         return header.seq != 0 && header.page == PAGE_NONE &&
                header.payload_len == 0 &&
@@ -580,6 +606,8 @@ void Node::completePending(const MsgHeader& response,
                 ? DSM_E_BADADDR
             : response.type == static_cast<std::uint8_t>(MessageType::QueryReply)
                 ? DSM_E_INVAL
+            : response.type == static_cast<std::uint8_t>(MessageType::JoinAck)
+                ? DSM_E_CONFIG
                 : DSM_E_NET;
     pending->complete = true;
     sem_post(&pending->ready);
@@ -670,6 +698,25 @@ int Node::sendFreeRequest(std::uint8_t home, std::uint32_t first_page,
                           MessageType::FreeReply, response);
 }
 
+// Carga de JOIN: los parámetros de dsm.conf que todos deben compartir (como en el
+// Entregable 1). Quien lo recibe la compara byte por byte con la suya.
+std::vector<std::uint8_t> Node::joinPayload() const {
+    std::vector<std::uint8_t> payload;
+    payload.reserve(JOIN_FIXED_SIZE + 4 * config_.num_hosts);
+    appendU32(payload, static_cast<std::uint32_t>(config_.dsm_base >> 32));
+    appendU32(payload, static_cast<std::uint32_t>(config_.dsm_base));
+    appendU32(payload, config_.page_size);
+    appendU32(payload, config_.pages_per_node);
+    appendU32(payload, config_.heartbeat_ms);
+    appendU32(payload, config_.timeout_ms);
+    appendU32(payload, (static_cast<std::uint32_t>(config_.port_base) << 16) |
+                           config_.num_hosts);
+    for (std::size_t id = 0; id < config_.num_hosts; ++id) {
+        appendU32(payload, ntohl(peer_addresses_[id].sin_addr.s_addr));
+    }
+    return payload;
+}
+
 void Node::joinLoop() {
     while (running_) {
         for (std::size_t id = 0; id < config_.num_hosts && running_; ++id) {
@@ -679,10 +726,17 @@ void Node::joinLoop() {
             }
             std::vector<std::uint8_t> response;
             const int result = requestMessage(
-                peer, MessageType::Join, PAGE_NONE, {},
+                peer, MessageType::Join, PAGE_NONE, joinPayload(),
                 MessageType::JoinAck, response);
             if (result == DSM_OK) {
                 joined_[id] = true;
+            } else if (result == DSM_E_CONFIG && !config_mismatch_[id].exchange(true)) {
+                // Se sigue reintentando: si el otro nodo corrige su dsm.conf y reinicia, entra.
+                monitorEvent("El nodo " + std::to_string(id) +
+                             " rechazó el JOIN: su dsm.conf es distinto al de este nodo");
+            }
+            if (result == DSM_E_CONFIG) {
+                node_table_.markOffline(peer);
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(250));

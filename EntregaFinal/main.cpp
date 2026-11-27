@@ -33,6 +33,7 @@ void printHelp() {
                  "  stats                             estadísticas de todos los nodos\n"
                  "  pages                             vista de páginas por nodo (flechas, q sale)\n"
                  "  pages <node_id>                   lista las páginas asignadas en ese home\n"
+                 "  pages all                         tabla de páginas de todo el sistema\n"
                  "  run <app> <archivos>              corre una aplicación en este nodo:\n"
                  "                                      wordcount <texto>, matmul <a> <b>,\n"
                  "                                      imgfilter <imagen.ppm>\n"
@@ -303,7 +304,7 @@ void pagesView(Node& node) {
 }
 
 // stats: estadísticas de todos los nodos y del sistema.
-// pages <id>: páginas asignadas cuyo home es el nodo id (directorio MSI).
+// pages <id|all>: páginas asignadas en un home o en todos (directorio MSI).
 bool handleQueryCommand(Node& node, const std::string& command) {
     std::istringstream input(command);
     std::string operation;
@@ -348,47 +349,63 @@ bool handleQueryCommand(Node& node, const std::string& command) {
         return true;
     }
 
+    // pages all: la tabla de todo el sistema, home por home; pages <id>: un solo home.
     std::string target_text;
-    std::uint8_t target = 0;
+    std::vector<std::uint8_t> targets;
     try {
         if (!(input >> target_text)) {
-            throw std::runtime_error("falta node_id");
+            throw std::runtime_error("falta node_id o all");
         }
-        target = parseNodeId(target_text);
-        if (target >= entries.size()) {
-            throw std::runtime_error("node_id no configurado");
+        if (target_text == "all") {
+            for (const auto& entry : entries) {
+                targets.push_back(entry.node_id);
+            }
+        } else {
+            const std::uint8_t target = parseNodeId(target_text);
+            if (target >= entries.size()) {
+                throw std::runtime_error("node_id no configurado");
+            }
+            targets.push_back(target);
         }
     } catch (const std::exception& error) {
-        std::printf("Uso: pages <node_id> (%s)\n", error.what());
+        std::printf("Uso: pages <node_id|all> (%s)\n", error.what());
         return true;
     }
-    const NodeInfo& info = entries[target];
     const Config& config = node.config();
-    std::printf("\nPáginas asignadas con home en el nodo %u (estado = copia del home):\n"
-                "Página  Dirección       Proceso  Orden  Dueño  Estado  Copias\n",
-                static_cast<unsigned int>(target));
-    std::vector<PageEntry> pages;
-    const int result = fetchHomePages(node, info, pages);
-    if (result != DSM_OK) {
-        std::printf("Sin respuesta del nodo %u: %s\n",
-                    static_cast<unsigned int>(target), dsm_strerror(result));
-        return true;
-    }
+    std::printf("\nPáginas asignadas %s (estado = copia del home):\n"
+                "Home  Página  Dirección       Proceso  Orden  Dueño  Estado  Copias\n",
+                targets.size() == 1 ? ("con home en el nodo " + target_text).c_str()
+                                    : "en todo el sistema");
     unsigned int shown = 0;
-    for (std::uint32_t index = 0; index < info.num_pages; ++index) {
-        const PageEntry& entry = pages[index];
-        if (entry.proc_id == 0) {
+    unsigned int total = 0;
+    for (const std::uint8_t target : targets) {
+        const NodeInfo& info = entries[target];
+        std::vector<PageEntry> pages;
+        const int result = info.state == static_cast<std::uint8_t>(NodeState::Online)
+            ? fetchHomePages(node, info, pages)
+            : DSM_E_NODE_DOWN;
+        if (result != DSM_OK) {
+            std::printf("%4u  sin respuesta: %s\n", static_cast<unsigned int>(target),
+                        dsm_strerror(result));
             continue;
         }
-        const std::uint32_t page = info.first_page + index;
-        std::printf("%6u  0x%012llx  %7u  %5u  %5u  %6s  %s\n", page,
-                    static_cast<unsigned long long>(
-                        config.dsm_base + static_cast<std::uint64_t>(page) * config.page_size),
-                    entry.proc_id, entry.order, static_cast<unsigned int>(entry.owner),
-                    stateName(entry.state), nodeList(entry.copyset, entries.size()).c_str());
-        ++shown;
+        total += info.num_pages;
+        for (std::uint32_t index = 0; index < info.num_pages; ++index) {
+            const PageEntry& entry = pages[index];
+            if (entry.proc_id == 0) {
+                continue;
+            }
+            const std::uint32_t page = info.first_page + index;
+            std::printf("%4u  %6u  0x%012llx  %7u  %5u  %5u  %6s  %s\n",
+                        static_cast<unsigned int>(target), page,
+                        static_cast<unsigned long long>(
+                            config.dsm_base + static_cast<std::uint64_t>(page) * config.page_size),
+                        entry.proc_id, entry.order, static_cast<unsigned int>(entry.owner),
+                        stateName(entry.state), nodeList(entry.copyset, entries.size()).c_str());
+            ++shown;
+        }
     }
-    std::printf("%u de %u páginas asignadas.\n", shown, info.num_pages);
+    std::printf("%u de %u páginas asignadas.\n", shown, total);
     std::fflush(stdout);
     return true;
 }
