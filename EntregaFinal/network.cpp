@@ -4,6 +4,19 @@
 
 namespace dsm {
 
+bool Node::sendRunRequest(std::uint8_t target, const std::string& command) const {
+    if (target >= config_.num_hosts || target == node_id_ || command.empty() ||
+        command.size() > DEMO_MAX_BYTES) {
+        return false;
+    }
+    MsgHeader header{};
+    header.type = static_cast<std::uint8_t>(MessageType::RunRequest);
+    header.seq = next_sequence_.fetch_add(1);
+    header.page = PAGE_NONE;
+    return sendFrame(target, Channel::Control, header,
+                     reinterpret_cast<const std::uint8_t*>(command.data()), command.size());
+}
+
 bool Node::sendDemoMessage(std::optional<std::uint8_t> target, Channel channel,
                      const std::string& message) const {
     if (channel == Channel::Heartbeat || message.empty() ||
@@ -377,6 +390,9 @@ bool Node::validMessage(const Connection& connection) const {
         return header.seq != 0 && header.page == PAGE_NONE &&
                header.payload_len == 0 &&
                header.status <= STATUS_INVALID;
+    case MessageType::RunRequest:
+        return header.status == STATUS_OK && header.page == PAGE_NONE &&
+               header.payload_len > 0 && header.payload_len <= DEMO_MAX_BYTES;
     case MessageType::QueryRequest:
         return header.seq != 0 && header.status == STATUS_OK &&
                header.page == PAGE_NONE &&
@@ -453,6 +469,19 @@ void Node::handleMessage(Connection& connection) {
     case MessageType::QueryRequest:
         handleQuery(header, connection.payload);
         break;
+    case MessageType::RunRequest: {
+        // El handler solo lanza un hilo de usuario, así que el hilo de red no espera.
+        std::function<void(std::uint8_t, const std::string&)> handler;
+        {
+            std::lock_guard<std::mutex> lock(run_handler_mutex_);
+            handler = run_handler_;
+        }
+        if (handler) {
+            handler(header.sender, std::string(connection.payload.begin(),
+                                               connection.payload.end()));
+        }
+        break;
+    }
     case MessageType::AllocRequest:
         handleAllocRequest(header, connection.payload);
         break;

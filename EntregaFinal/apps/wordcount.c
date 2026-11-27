@@ -1,13 +1,14 @@
 /* Aplicación de prueba 1: conteo distribuido de palabras, líneas y letras.
  *
- * Todos los nodos son iguales y ejecutan lo mismo: run wordcount <archivo>
- * (el mismo archivo de texto en todas las máquinas, hasta ~1 MB).
+ * En el nodo origen: run wordcount <archivo> (texto de hasta la memoria del sistema).
+ * Los demás nodos la reciben como run wordcount, sin archivo.
  *
- * 1. Cada nodo copia al segmento compartido su tramo del texto.
- * 2. Barrera. Cada nodo cuenta el tramo que cargó el nodo siguiente, así siempre
- *    lee páginas escritas por otro, y deja su resultado en su página de control.
- * 3. Barrera. Cada nodo suma los resultados de todos y los compara con el conteo
- *    secuencial de su copia local del archivo; todos imprimen lo mismo.
+ * 1. El origen lee el archivo, lo copia al segmento compartido y publica su largo.
+ *    Si el texto no cabe en un nodo, el segmento sigue en la memoria de otros nodos.
+ * 2. Barrera. Cada nodo cuenta su tramo con varios pthreads, leyendo el texto a
+ *    través del DSM, y deja el resultado en su página de control.
+ * 3. Barrera. Todos suman los resultados; el origen los compara con el conteo
+ *    secuencial, los guarda en output/wordcount.txt y publica el veredicto.
  * 4. Barrera y dsm_free; el segmento se libera cuando lo suelta el último nodo.
  */
 #include "app_common.h"
@@ -18,7 +19,7 @@
 /* Página de control de cada nodo. phase va primero: lo usa app_barrier. */
 typedef struct {
     uint32_t phase;
-    uint32_t chunk;
+    uint32_t reserved;
     uint64_t words;
     uint64_t lines;
     uint64_t letters[26];
@@ -78,60 +79,86 @@ static void count_task(void* context, uint64_t begin, uint64_t end, int thread) 
     count(job->text, begin, end, &job->results[thread]);
 }
 
-/* Corre la aplicación en el nodo ya iniciado de este proceso. La usan el comando
-   run de dsmnode y el main de abajo. */
-int wordcount_run(int node_id, int argc, char* argv[]) {
-    if (argc < 1) {
-        fprintf(stderr, "Uso: wordcount <archivo>\n");
-        return 2;
+static void add_result(result_t* total, const result_t* part) {
+    total->words += part->words;
+    total->lines += part->lines;
+    for (int l = 0; l < 26; ++l) {
+        total->letters[l] += part->letters[l];
     }
-    uint64_t length = 0;
-    char* local = read_file(argv[0], &length);
-    if (local == NULL) {
-        return 1;
-    }
+}
 
+/* Corre la aplicación en el nodo ya iniciado de este proceso. Con argumento este
+   nodo es el origen; sin argumentos toma el texto del DSM. */
+int wordcount_run(int node_id, int argc, char* argv[]) {
+    const int origin = argc >= 1;
     const int nodes = app_node_count();
     app_wait_all_online();
+    volatile app_info_t* info = app_info_join(PROC_WORDCOUNT, nodes);
+    double start = app_now_ms();
     const size_t page = dsm_page_size();
-    const double start = app_now_ms();
+
+    char* local = NULL;
+    uint64_t length = 0;
+    if (origin) {
+        local = read_file(argv[0], &length);
+        if (local != NULL && length + nodes * page > app_system_bytes()) {
+            fprintf(stderr, "El texto ocupa %llu KB y el sistema tiene %zu KB entre todos "
+                            "los nodos.\n",
+                    (unsigned long long)length / 1024, app_system_bytes() / 1024);
+            free(local);
+            local = NULL;
+        }
+        if (local == NULL || length == 0) {
+            app_info_cancel(info, node_id, nodes);
+            dsm_free((void*)info);
+            free(local);
+            return 1;
+        }
+        info->params[0] = length;
+        app_info_publish(info, node_id);
+    } else {
+        if (!app_info_wait(info, node_id)) {
+            dsm_free((void*)info);
+            return 1;
+        }
+        length = info->params[0];
+    }
+
+    start = app_now_ms(); /* La carga se mide desde que la entrada está publicada. */
     char* segment = app_join(PROC_WORDCOUNT, nodes * page + length, node_id);
     if (segment == NULL) {
+        dsm_free((void*)info);
         free(local);
         return 1;
     }
     char* text = segment + nodes * page;
-    result_t* mine = (result_t*)(segment + node_id * page);
-
-    const uint64_t begin = length * node_id / nodes;
-    const uint64_t end = length * (node_id + 1) / nodes;
-    memcpy(text + begin, local + begin, end - begin);
-    printf("Nodo %d: bytes [%llu, %llu) del texto cargados en el DSM (%p).\n", node_id,
-           (unsigned long long)begin, (unsigned long long)end, (void*)segment);
-    fflush(stdout);
+    if (origin) {
+        memcpy(text, local, length);
+        printf("Nodo %d: texto de %llu bytes cargado en el DSM (%p).\n", node_id,
+               (unsigned long long)length, (void*)segment);
+        fflush(stdout);
+    }
     app_barrier(segment, node_id, nodes, 1);
     const double loaded = app_now_ms();
 
-    const int chunk = (node_id + 1) % nodes;
+    const uint64_t begin = length * node_id / nodes;
+    const uint64_t end = length * (node_id + 1) / nodes;
     count_job_t job;
     memset(&job, 0, sizeof(job));
     job.text = text;
-    app_parallel(count_task, &job, length * chunk / nodes, length * (chunk + 1) / nodes);
+    app_parallel(count_task, &job, begin, end);
+    result_t* mine = (result_t*)(segment + node_id * page);
     result_t partial;
     memset(&partial, 0, sizeof(partial));
     for (int t = 0; t < APP_THREADS; ++t) {
-        partial.words += job.results[t].words;
-        partial.lines += job.results[t].lines;
-        for (int l = 0; l < 26; ++l) {
-            partial.letters[l] += job.results[t].letters[l];
-        }
+        add_result(&partial, &job.results[t]);
     }
-    mine->chunk = (uint32_t)chunk;
     mine->words = partial.words;
     mine->lines = partial.lines;
     memcpy(mine->letters, partial.letters, sizeof(partial.letters));
-    printf("Nodo %d: contó el tramo del nodo %d con %d pthreads: %llu palabras.\n", node_id,
-           chunk, APP_THREADS, (unsigned long long)partial.words);
+    printf("Nodo %d: bytes [%llu, %llu) contados con %d pthreads: %llu palabras.\n", node_id,
+           (unsigned long long)begin, (unsigned long long)end, APP_THREADS,
+           (unsigned long long)partial.words);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 2);
     const double computed = app_now_ms();
@@ -139,19 +166,31 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
     result_t total;
     memset(&total, 0, sizeof(total));
     for (int n = 0; n < nodes; ++n) {
-        const result_t* other = (const result_t*)(segment + n * page);
-        total.words += other->words;
-        total.lines += other->lines;
-        for (int l = 0; l < 26; ++l) {
-            total.letters[l] += other->letters[l];
-        }
+        add_result(&total, (const result_t*)(segment + n * page));
     }
-    result_t expected;
-    const double sequential_start = app_now_ms();
-    count(local, 0, length, &expected);
-    const double sequential = app_now_ms() - sequential_start;
-    const int ok = total.words == expected.words && total.lines == expected.lines &&
-                   memcmp(total.letters, expected.letters, sizeof(total.letters)) == 0;
+    double sequential = -1;
+    if (origin) {
+        result_t expected;
+        const double sequential_start = app_now_ms();
+        count(local, 0, length, &expected);
+        sequential = app_now_ms() - sequential_start;
+        const int ok = total.words == expected.words && total.lines == expected.lines &&
+                       memcmp(total.letters, expected.letters, sizeof(total.letters)) == 0;
+        char path[512];
+        FILE* output = app_output("wordcount", ".txt", path, sizeof(path));
+        if (output != NULL) {
+            fprintf(output, "archivo %s\npalabras %llu\nlineas %llu\n", argv[0],
+                    (unsigned long long)total.words, (unsigned long long)total.lines);
+            for (int l = 0; l < 26; ++l) {
+                fprintf(output, "%c %llu\n", 'a' + l, (unsigned long long)total.letters[l]);
+            }
+            fclose(output);
+            printf("Nodo %d: conteo guardado en %s\n", node_id, path);
+        }
+        printf("Nodo %d: verificación contra el conteo secuencial: %s\n", node_id,
+               ok ? "CORRECTA" : "ERROR");
+        info->verdict = ok ? APP_VERDICT_OK : APP_VERDICT_ERROR;
+    }
     printf("Nodo %d: %llu palabras, %llu líneas; letras más frecuentes:", node_id,
            (unsigned long long)total.words, (unsigned long long)total.lines);
     for (int shown = 0; shown < 5; ++shown) {
@@ -164,22 +203,28 @@ int wordcount_run(int node_id, int argc, char* argv[]) {
         printf(" %c=%llu", 'a' + best, (unsigned long long)total.letters[best]);
         total.letters[best] = 0;
     }
-    printf("\nNodo %d: verificación contra el conteo secuencial: %s\n", node_id,
-           ok ? "CORRECTA" : "ERROR");
+    printf("\n");
     app_print_times(node_id, start, loaded, computed, sequential);
     app_print_stats(node_id);
     fflush(stdout);
     app_barrier(segment, node_id, nodes, 3);
 
-    dsm_free(segment); /* Si su home ya terminó, esa memoria ya no existe: no es un error. */
+    const uint32_t verdict = info->verdict;
+    if (!origin) {
+        printf("Nodo %d: verificación del nodo %u: %s\n", node_id, info->origin,
+               app_verdict_name(verdict));
+    }
+    /* Si el home de un segmento ya terminó, esa memoria ya no existe: no es un error. */
+    dsm_free(segment);
+    dsm_free((void*)info);
     free(local);
-    return ok ? 0 : 1;
+    return verdict == APP_VERDICT_OK ? 0 : 1;
 }
 
 #ifndef APP_NO_MAIN
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> <archivo>\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> [archivo (nodo origen)]\n", argv[0]);
         return 2;
     }
     const int node_id = atoi(argv[2]);

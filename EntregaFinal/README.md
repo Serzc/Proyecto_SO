@@ -41,7 +41,9 @@ En cada máquina se inicia un nodo con su consola:
 ./dsmnode dsm.conf <id>
 ```
 
-Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso, las asignaciones con sus copias y el log de solicitudes que ese nodo atendió como home (quién pidió qué página, qué se concedió, a quién se invalidó y de quién vino el write-back). La vista se redibuja sola cuando algo cambia. Las aplicaciones corren dentro del nodo ya iniciado:
+Comandos: `nodes`, `stats`, `pages <id>`, `run <app> [args]`, `monitor`, `help` y `quit`. Los mensajes recibidos y los cambios de estado de los nodos no interrumpen la consola: se ven con `monitor` (Enter para salir). `pages` abre una vista por nodo (flechas izquierda y derecha para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso, las asignaciones con sus copias y el log de solicitudes que ese nodo atendió como home (quién pidió qué página, qué se concedió, a quién se invalidó y de quién vino el write-back). La vista se redibuja sola cuando algo cambia.
+
+Las aplicaciones se lanzan desde la consola de **un solo nodo**, el que tiene los archivos de entrada; los demás nodos no escriben nada:
 
 ```
 run matmul data/matriz_a.txt data/matriz_b.txt
@@ -49,11 +51,11 @@ run wordcount data/enunciado_dsm.txt
 run imgfilter data/aldrin.ppm
 ```
 
-No hay coordinador: todos los nodos escriben el mismo comando, en cualquier orden. Cada uno carga su parte de los datos, calcula su parte leyendo lo que cargaron los demás y verifica el resultado completo contra un cálculo secuencial (`CORRECTA` o `ERROR`). Deben participar todos los nodos de `dsm.conf`. `quit` espera a que terminen las aplicaciones en curso.
+Ese nodo es el origen de la corrida (cualquier nodo puede serlo): lee los archivos, copia la entrada al DSM y les pide a los demás nodos (mensaje `RUN_REQUEST`) que ejecuten la misma app sin archivos. Los demás nodos toman la entrada del DSM: las páginas les llegan por la red, así que los archivos solo tienen que estar en la máquina del origen. Todos calculan su parte con 4 pthreads; el origen compara el resultado con un cálculo secuencial, publica el veredicto (`CORRECTA` o `ERROR`) y guarda el resultado en `output/`: `matmul_C.txt` (C en el mismo formato que las matrices de entrada), `wordcount.txt` (palabras, líneas y cada letra) o `<imagen>_lapiz.pgm`. Si el archivo no existe o no cabe en el sistema, el origen cancela la corrida y los demás nodos lo avisan. Deben estar en línea todos los nodos de `dsm.conf`. `quit` espera a que terminen las aplicaciones en curso.
 
-`imgfilter` convierte una foto (PPM P6) a un dibujo a lápiz en blanco y negro: escala de grises y bordes con Sobel. Cada nodo guarda la imagen como un segmento por banda de filas, con su home en nodos distintos, así que la foto de prueba (1280x1288, 6.4 MB en el DSM entre entrada y salida) no cabe en la memoria de un solo nodo; necesita `pages_per_node = 1024` y al menos dos nodos. Cada nodo escribe el resultado en `data/aldrin_lapiz_n<id>.pgm`. Otras fotos se convierten a PPM con cualquier editor o con `convert foto.jpg foto.ppm` (ImageMagick). La foto de prueba es "Aldrin Apollo 11" de la NASA, de dominio público (Wikimedia Commons).
+`imgfilter` convierte una foto (PPM P6) a un dibujo a lápiz en blanco y negro: escala de grises y bordes con Sobel. Cada nodo guarda la imagen como un segmento por banda de filas, con su home en nodos distintos, así que la foto de prueba (1280x1288, 6.4 MB en el DSM entre entrada y salida) no cabe en la memoria de un solo nodo; necesita `pages_per_node = 1024` y al menos dos nodos. Otras fotos se convierten a PPM con cualquier editor o con `convert foto.jpg foto.ppm` (ImageMagick). La foto de prueba es "Aldrin Apollo 11" de la NASA, de dominio público (Wikimedia Commons).
 
-Las aplicaciones también existen como programas aparte que inician su propio nodo: `./matmul dsm.conf <id> <matriz_a> <matriz_b>`, `./wordcount dsm.conf <id> <archivo>` e `./imgfilter dsm.conf <id> <imagen.ppm>`.
+Las aplicaciones también existen como programas aparte que inician su propio nodo (las usa `bench.sh`): en el origen `./matmul dsm.conf <id> <matriz_a> <matriz_b>`, `./wordcount dsm.conf <id> <archivo>` o `./imgfilter dsm.conf <id> <imagen.ppm>`, y en los demás nodos el mismo programa sin archivos.
 
 ## Arquitectura
 

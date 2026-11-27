@@ -1,18 +1,19 @@
 /* Aplicación de prueba 3: filtro de imagen "dibujo a lápiz" en blanco y negro.
  *
- * Todos los nodos son iguales y ejecutan lo mismo: run imgfilter <imagen.ppm>
- * (PPM binario P6, la misma imagen en todas las máquinas).
+ * En el nodo origen: run imgfilter <imagen.ppm> (PPM binario P6). Los demás nodos la
+ * reciben como run imgfilter, sin archivo.
  *
  * La imagen se reparte en bandas de filas, una por nodo, y cada banda es su propio
  * segmento compartido con su home en un nodo distinto. Así la imagen puede ser más
  * grande que la memoria que aporta un solo nodo.
  *
- * 1. Cada nodo copia su banda de la imagen RGB a su segmento de entrada.
- * 2. Barrera. Cada nodo calcula su banda de salida: escala de grises y bordes con
- *    Sobel, invertidos (líneas oscuras sobre blanco). Sobel usa las filas vecinas,
- *    así que en los bordes de la banda lee filas del segmento de otro nodo.
- * 3. Barrera. Cada nodo lee la imagen de salida completa, la compara con el filtro
- *    secuencial aplicado a su copia local y la guarda como <imagen>_lapiz_n<id>.pgm.
+ * 1. El origen lee la imagen, copia las bandas RGB a los segmentos de entrada y
+ *    publica el ancho y el alto.
+ * 2. Barrera. Cada nodo calcula su banda de salida con varios pthreads: escala de
+ *    grises y bordes con Sobel, invertidos (líneas oscuras sobre blanco). Lee la
+ *    entrada por el DSM, incluidas las filas vecinas de las bandas de otros nodos.
+ * 3. Barrera. El origen compara la salida completa con el filtro secuencial, la guarda
+ *    en output/<imagen>_lapiz.pgm y publica el veredicto.
  * 4. Barrera y dsm_free de todos los segmentos.
  */
 #include "app_common.h"
@@ -86,10 +87,17 @@ static unsigned char sketch(int g[3][3]) {
     return (unsigned char)(255 - magnitude);
 }
 
-static int write_pgm(const char* path, const image_t* img) {
-    FILE* file = fopen(path, "wb");
+/* Guarda la imagen de salida (PGM P5) en output/<imagen>_lapiz.pgm. */
+static int write_pgm(const char* input_path, const image_t* img, char* path,
+                     size_t path_size) {
+    const char* slash = strrchr(input_path, '/');
+    const char* base = slash != NULL ? slash + 1 : input_path;
+    const char* dot = strrchr(base, '.');
+    char name[256];
+    snprintf(name, sizeof(name), "%.*s_lapiz",
+             dot != NULL ? (int)(dot - base) : (int)strlen(base), base);
+    FILE* file = app_output(name, ".pgm", path, path_size);
     if (file == NULL) {
-        perror(path);
         return 0;
     }
     fprintf(file, "P5\n%u %u\n255\n", img->width, img->height);
@@ -131,46 +139,58 @@ static void filter_task(void* context, uint64_t begin, uint64_t end, int thread)
     }
 }
 
-/* Corre la aplicación en el nodo ya iniciado de este proceso. La usan el comando
-   run de dsmnode y el main de abajo. */
+/* Corre la aplicación en el nodo ya iniciado de este proceso. Con argumento este
+   nodo es el origen; sin argumentos toma la imagen del DSM. */
 int imgfilter_run(int node_id, int argc, char* argv[]) {
-    if (argc < 1) {
-        fprintf(stderr, "Uso: imgfilter <imagen.ppm>\n");
-        return 2;
-    }
+    const int origin = argc >= 1;
     image_t img;
     memset(&img, 0, sizeof(img));
-    unsigned char* local = read_ppm(argv[0], &img.width, &img.height);
-    if (local == NULL) {
-        return 1;
-    }
-    if (img.width > 8192) {
-        fprintf(stderr, "La imagen puede tener como máximo 8192 píxeles de ancho.\n");
-        free(local);
-        return 1;
-    }
-
     img.nodes = app_node_count();
     app_wait_all_online();
+    volatile app_info_t* info = app_info_join(PROC_IMG_CONTROL, img.nodes);
+    double start = app_now_ms();
+
+    unsigned char* local = NULL;
+    if (origin) {
+        local = read_ppm(argv[0], &img.width, &img.height);
+        const size_t image_bytes = (size_t)img.width * img.height * 4;
+        if (local != NULL && img.width > 8192) {
+            fprintf(stderr, "La imagen puede tener como máximo 8192 píxeles de ancho.\n");
+            free(local);
+            local = NULL;
+        } else if (local != NULL && image_bytes > app_system_bytes()) {
+            /* Entrada RGB y salida en gris; una banda puede ocupar varios nodos. */
+            fprintf(stderr, "La imagen necesita %zu KB y el sistema tiene %zu KB entre "
+                            "todos los nodos: se necesitan más nodos o una imagen más "
+                            "pequeña.\n",
+                    image_bytes / 1024, app_system_bytes() / 1024);
+            free(local);
+            local = NULL;
+        }
+        if (local == NULL) {
+            app_info_cancel(info, node_id, img.nodes);
+            dsm_free((void*)info);
+            return 1;
+        }
+        info->params[0] = img.width;
+        info->params[1] = img.height;
+        app_info_publish(info, node_id);
+    } else {
+        if (!app_info_wait(info, node_id)) {
+            dsm_free((void*)info);
+            return 1;
+        }
+        img.width = (uint32_t)info->params[0];
+        img.height = (uint32_t)info->params[1];
+    }
+
+    start = app_now_ms(); /* La carga se mide desde que la entrada está publicada. */
     for (int band = 0; band <= img.nodes; ++band) {
         img.first_row[band] = (uint32_t)((uint64_t)img.height * band / img.nodes);
     }
-    /* La imagen (entrada RGB y salida en gris) debe caber en la memoria de todo el
-       sistema; una banda puede ocupar varios nodos si su home no tiene lugar. */
-    dsm_node_t info[APP_MAX_NODES];
-    app_check(dsm_nodes(info, APP_MAX_NODES), "dsm_nodes");
-    const size_t system_bytes = (size_t)img.nodes * info[0].num_pages * dsm_page_size();
-    const size_t image_bytes = (size_t)img.width * img.height * 4;
-    if (image_bytes > system_bytes) {
-        fprintf(stderr, "La imagen necesita %zu KB y el sistema tiene %zu KB entre todos los "
-                        "nodos: se necesitan más nodos o una imagen más pequeña.\n",
-                image_bytes / 1024, system_bytes / 1024);
-        free(local);
-        return 1;
-    }
-    const double start = app_now_ms();
     char* control = app_join(PROC_IMG_CONTROL, img.nodes * dsm_page_size(), node_id);
     if (control == NULL) {
+        dsm_free((void*)info);
         free(local);
         return 1;
     }
@@ -187,17 +207,21 @@ int imgfilter_run(int node_id, int argc, char* argv[]) {
         img.output[band] = output;
         total += rows * img.width * 4;
     }
-    const uint32_t first = img.first_row[node_id];
-    const uint32_t last = img.first_row[node_id + 1];
-    memcpy((void*)img.input[node_id], local + (size_t)first * img.width * 3,
-           (size_t)(last - first) * img.width * 3);
-    printf("Nodo %d: imagen de %ux%u (%zu KB en el DSM, %d segmentos); filas [%u, %u) "
-           "cargadas.\n",
-           node_id, img.width, img.height, total / 1024, 2 * img.nodes + 1, first, last);
-    fflush(stdout);
+    if (origin) {
+        for (int band = 0; band < img.nodes; ++band) {
+            memcpy((void*)img.input[band],
+                   local + (size_t)img.first_row[band] * img.width * 3,
+                   (size_t)(img.first_row[band + 1] - img.first_row[band]) * img.width * 3);
+        }
+        printf("Nodo %d: imagen de %ux%u cargada en el DSM (%zu KB, %d segmentos).\n",
+               node_id, img.width, img.height, total / 1024, 2 * img.nodes + 1);
+        fflush(stdout);
+    }
     app_barrier(control, node_id, img.nodes, 1);
     const double loaded = app_now_ms();
 
+    const uint32_t first = img.first_row[node_id];
+    const uint32_t last = img.first_row[node_id + 1];
     filter_job_t job = {&img, node_id};
     app_parallel(filter_task, &job, first, last);
     printf("Nodo %d: filtro aplicado a las filas [%u, %u) con %d pthreads.\n", node_id, first,
@@ -206,61 +230,70 @@ int imgfilter_run(int node_id, int argc, char* argv[]) {
     app_barrier(control, node_id, img.nodes, 2);
     const double computed = app_now_ms();
 
-    const double sequential_start = app_now_ms();
-    unsigned char* expected = malloc((size_t)img.width * img.height);
-    for (uint32_t y = 0; expected != NULL && y < img.height; ++y) {
-        for (uint32_t x = 0; x < img.width; ++x) {
-            int g[3][3];
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    g[dy + 1][dx + 1] =
-                        local_gray(local, img.width, img.height, (int)x + dx, (int)y + dy);
+    double sequential = -1;
+    if (origin) {
+        const double sequential_start = app_now_ms();
+        unsigned char* expected = malloc((size_t)img.width * img.height);
+        for (uint32_t y = 0; expected != NULL && y < img.height; ++y) {
+            for (uint32_t x = 0; x < img.width; ++x) {
+                int g[3][3];
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        g[dy + 1][dx + 1] = local_gray(local, img.width, img.height,
+                                                       (int)x + dx, (int)y + dy);
+                    }
+                }
+                expected[(size_t)y * img.width + x] = sketch(g);
+            }
+        }
+        sequential = app_now_ms() - sequential_start;
+        uint32_t wrong = expected == NULL ? img.width * img.height : 0;
+        uint64_t checksum = 0;
+        for (int band = 0; expected != NULL && band < img.nodes; ++band) {
+            for (uint32_t y = img.first_row[band]; y < img.first_row[band + 1]; ++y) {
+                for (uint32_t x = 0; x < img.width; ++x) {
+                    const unsigned char value =
+                        img.output[band][(size_t)(y - img.first_row[band]) * img.width + x];
+                    wrong += value != expected[(size_t)y * img.width + x];
+                    checksum += value;
                 }
             }
-            expected[(size_t)y * img.width + x] = sketch(g);
         }
+        free(expected);
+        char path[512];
+        const int saved = write_pgm(argv[0], &img, path, sizeof(path));
+        printf("Nodo %d: suma de la salida = %llu; verificación contra el filtro secuencial: "
+               "%s (%u de %u píxeles distintos)%s%s\n",
+               node_id, (unsigned long long)checksum, wrong == 0 ? "CORRECTA" : "ERROR",
+               wrong, img.width * img.height, saved ? "; guardada en " : "",
+               saved ? path : "");
+        info->verdict = wrong == 0 ? APP_VERDICT_OK : APP_VERDICT_ERROR;
     }
-    const double sequential = app_now_ms() - sequential_start;
-    uint32_t wrong = expected == NULL ? img.width * img.height : 0;
-    uint64_t checksum = 0;
-    for (int band = 0; expected != NULL && band < img.nodes; ++band) {
-        for (uint32_t y = img.first_row[band]; y < img.first_row[band + 1]; ++y) {
-            for (uint32_t x = 0; x < img.width; ++x) {
-                const unsigned char value =
-                    img.output[band][(size_t)(y - img.first_row[band]) * img.width + x];
-                wrong += value != expected[(size_t)y * img.width + x];
-                checksum += value;
-            }
-        }
-    }
-    free(expected);
-    char path[512];
-    const char* dot = strrchr(argv[0], '.');
-    const int stem = dot != NULL ? (int)(dot - argv[0]) : (int)strlen(argv[0]);
-    snprintf(path, sizeof(path), "%.*s_lapiz_n%d.pgm", stem, argv[0], node_id);
-    const int saved = write_pgm(path, &img);
-    printf("Nodo %d: suma de la salida = %llu; verificación contra el filtro secuencial: "
-           "%s (%u de %u píxeles distintos)%s%s\n",
-           node_id, (unsigned long long)checksum, wrong == 0 ? "CORRECTA" : "ERROR", wrong,
-           img.width * img.height, saved ? "; guardada en " : "", saved ? path : "");
     app_print_times(node_id, start, loaded, computed, sequential);
     app_print_stats(node_id);
     fflush(stdout);
     app_barrier(control, node_id, img.nodes, 3);
 
+    const uint32_t verdict = info->verdict;
+    if (!origin) {
+        printf("Nodo %d: verificación del nodo %u: %s\n", node_id, info->origin,
+               app_verdict_name(verdict));
+    }
+    /* Si el home de un segmento ya terminó, esa memoria ya no existe: no es un error. */
     for (int band = 0; band < img.nodes; ++band) {
-        dsm_free((void*)img.input[band]); /* Si el home ya terminó, no es un error. */
+        dsm_free((void*)img.input[band]);
         dsm_free((void*)img.output[band]);
     }
     dsm_free(control);
+    dsm_free((void*)info);
     free(local);
-    return wrong == 0 ? 0 : 1;
+    return verdict == APP_VERDICT_OK ? 0 : 1;
 }
 
 #ifndef APP_NO_MAIN
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> <imagen.ppm>\n", argv[0]);
+    if (argc != 3 && argc != 4) {
+        fprintf(stderr, "Uso: %s <dsm.conf> <node_id> [imagen.ppm (nodo origen)]\n", argv[0]);
         return 2;
     }
     const int node_id = atoi(argv[2]);

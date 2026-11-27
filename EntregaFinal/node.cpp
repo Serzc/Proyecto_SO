@@ -173,6 +173,11 @@ void Node::stopService() {
     }
 }
 
+void Node::setRunHandler(std::function<void(std::uint8_t, const std::string&)> handler) {
+    std::lock_guard<std::mutex> lock(run_handler_mutex_);
+    run_handler_ = std::move(handler);
+}
+
 void Node::waitUserThreads() {
     joinThreads(user_threads_, user_threads_mutex_);
 }

@@ -118,7 +118,8 @@ enum class MessageType : std::uint8_t {
     Free = 10,
     QueryRequest = 11,
     QueryReply = 12,
-    FreeReply = 13
+    FreeReply = 13,
+    RunRequest = 14  // Pide ejecutar una app en el nodo destino (carga: el comando).
 };
 
 struct MsgHeader {
@@ -456,6 +457,9 @@ public:
     void launchUserThread(std::function<void()> application);
     // Espera a que terminen las aplicaciones lanzadas con launchUserThread.
     void waitUserThreads();
+    // Quien atiende RUN_REQUEST (la consola): recibe el nodo que lo pidió y el comando.
+    void setRunHandler(std::function<void(std::uint8_t, const std::string&)> handler);
+    bool sendRunRequest(std::uint8_t target, const std::string& command) const;
 
     std::vector<NodeInfo> nodes() const;
 
@@ -622,6 +626,8 @@ private:
     std::condition_variable service_ready_;
     std::deque<ServiceJob> service_queue_;
     std::thread service_thread_;
+    std::mutex run_handler_mutex_;
+    std::function<void(std::uint8_t, const std::string&)> run_handler_;
 
     // Región DSM local (ver setupMemory).
     int memfd_ = -1;

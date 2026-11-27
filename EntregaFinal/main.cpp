@@ -476,7 +476,7 @@ extern "C" int imgfilter_run(int node_id, int argc, char* argv[]);
 
 // run <app> [argumentos]: corre la aplicación en un hilo de este nodo, sin
 // detenerlo; la consola sigue disponible mientras tanto.
-void runApp(dsm::Node& node, const std::string& command) {
+void runApp(dsm::Node& node, const std::string& command, bool from_console) {
     std::istringstream input(command);
     std::string word;
     std::string app;
@@ -493,6 +493,36 @@ void runApp(dsm::Node& node, const std::string& command) {
     std::vector<std::string> args;
     for (std::string arg; input >> arg;) {
         args.push_back(arg);
+    }
+    if (from_console) {
+        if (args.empty()) {
+            std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
+            std::cout << "Falta la entrada: run " << app
+                      << (app == "matmul" ? " <matriz_a> <matriz_b>" : " <archivo>") << '\n'
+                      << std::flush;
+            return;
+        }
+        // Este nodo es el origen de la corrida: solo él lee los archivos y los copia al
+        // DSM. A los demás les pide la misma app sin archivos (RUN_REQUEST); ellos
+        // toman la entrada del DSM.
+        std::string sent;
+        std::string failed;
+        for (const auto& entry_info : node.nodes()) {
+            if (entry_info.node_id == node.nodeId()) {
+                continue;
+            }
+            std::string& list =
+                node.sendRunRequest(entry_info.node_id, "run " + app) ? sent : failed;
+            list += (list.empty() ? "" : ", ") + std::to_string(entry_info.node_id);
+        }
+        std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
+        std::cout << "Ejecutando en este nodo" << (sent.empty() ? "" : " y en los nodos " + sent)
+                  << (failed.empty() ? "" : "; sin respuesta de los nodos " + failed +
+                                                " (la app los esperará)")
+                  << ".\n"
+                  << std::flush;
+    } else {
+        args.clear();  // Un pedido remoto nunca trae archivos: la entrada está en el DSM.
     }
     const int node_id = node.nodeId();
     node.launchUserThread([entry, app, args, node_id]() mutable {
@@ -522,6 +552,17 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         dsm::Node& node = *dsm::apiNode();
+        // RUN_REQUEST de otro nodo: corre la misma app aquí, sin reenviarla.
+        node.setRunHandler([&node](std::uint8_t sender, const std::string& command) {
+            dsm::monitorEvent("El nodo " + std::to_string(sender) + " pidió: " + command);
+            {
+                std::lock_guard<std::mutex> lock(dsm::console_output_mutex);
+                std::cout << "\nEl nodo " << static_cast<unsigned int>(sender)
+                          << " pidió ejecutar: " << command << '\n'
+                          << std::flush;
+            }
+            runApp(node, command, false);
+        });
 
         std::atomic<bool> monitor_running{true};
         std::thread monitor([&] {
@@ -579,7 +620,7 @@ int main(int argc, char* argv[]) {
                 std::getline(std::cin, ignored);
                 dsm::setMonitorLive(false);
             } else if (command == "run" || command.rfind("run ", 0) == 0) {
-                runApp(node, command);
+                runApp(node, command, true);
             } else if (dsm::handleQueryCommand(node, command) ||
                        dsm::handleDemoCommand(node, command)) {
                 continue;

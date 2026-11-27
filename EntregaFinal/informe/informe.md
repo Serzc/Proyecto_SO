@@ -102,7 +102,8 @@ Cada frame es un encabezado de 16 bytes seguido de la carga. Los campos se codif
 | `INVALIDATE_ACK` | 7 | nodo -> home | página si estaba en M, si no ninguna |
 | `ALLOC_REQUEST` / `ALLOC_REPLY` | 8 / 9 | nodo -> home | cantidad y proceso / primera página |
 | `FREE` / `FREE_REPLY` | 10 / 13 | nodo -> home | primera página, cantidad y proceso |
-| `QUERY_REQUEST` / `QUERY_REPLY` | 11 / 12 | cualquiera -> nodo consultado | tipo, primera página, cantidad / 32 bytes de estadísticas o 16 bytes por página |
+| `QUERY_REQUEST` / `QUERY_REPLY` | 11 / 12 | cualquiera -> nodo consultado | tipo (estadísticas, páginas o log), primera página, cantidad / 32 bytes de estadísticas, o 16 bytes por página o por entrada del log |
+| `RUN_REQUEST` | 14 | nodo origen -> cada nodo | texto `run <app>`: el destino ejecuta la app sin archivos y toma la entrada del DSM; no tiene respuesta |
 
 Cada solicitud lleva un número de secuencia y se registra en la tabla de pendientes. La respuesta con esa secuencia, el emisor esperado y el tipo esperado despierta al hilo que espera. Si no llega antes de `timeout_ms`, la operación devuelve `DSM_E_TIMEOUT`.
 
@@ -153,51 +154,58 @@ Si el segmento no cabe en la memoria del home ancla (`proc % nodos`), el nodo qu
 
 # 10. Aplicaciones de prueba
 
-No hay coordinador ni servidor: todos los nodos son iguales y ejecutan el mismo comando (`run matmul <a> <b>` o `run wordcount <archivo>`) con los mismos archivos de entrada. Las dos aplicaciones siguen el mismo esquema:
+No hay un coordinador fijo ni un servidor. Una corrida se lanza desde la consola de un solo nodo, el que tiene los archivos de entrada (`run matmul <a> <b>`, `run wordcount <archivo>` o `run imgfilter <imagen>`). Ese nodo es el origen de esa corrida, pero cualquier nodo puede serlo. Los demás nodos no escriben nada: el origen les envía `RUN_REQUEST` con `run <app>`, sin archivos, y cada uno ejecuta la app en un hilo de su propio proceso. Las tres aplicaciones siguen el mismo esquema:
 
-1. Cada nodo se une al segmento compartido de la aplicación con `dsm_alloc`. Las primeras páginas del segmento son de control, una por nodo.
-2. Cada nodo copia al segmento su parte de los datos de entrada.
-3. Barrera: cada nodo anota la fase en su página de control y espera a que todos los nodos lleguen. La espera lee copias S locales; cuando otro nodo escribe su fase, la invalidación obliga a pedir la página otra vez, así que no hace falta otro mecanismo de sincronización.
-4. Cada nodo calcula su parte leyendo datos que cargaron otros nodos y deja el resultado en el segmento.
-5. Barrera. Cada nodo lee el resultado completo, lo compara con un cálculo secuencial hecho con su copia local de los archivos e imprime el veredicto. Todos imprimen lo mismo.
-6. Barrera final y `dsm_free`; el último nodo en salir libera el segmento.
+1. Todos se unen al segmento de información de la app, una página. El origen lee los archivos y publica ahí los tamaños de la entrada (n, el largo del texto o el ancho y alto de la imagen). Si el archivo no existe o no cabe en el sistema, marca la corrida como cancelada y espera a que todos los nodos lo hayan visto, para que nadie se quede esperando.
+2. Con esos tamaños, todos se unen a los segmentos de datos. Las primeras páginas son de control, una por nodo. El origen copia la entrada completa al DSM.
+3. Barrera: cada nodo anota la fase en su página de control y espera a que todos lleguen. La espera lee copias S locales; cuando otro nodo escribe su fase, la invalidación obliga a pedir la página otra vez, así que no hace falta otro mecanismo de sincronización.
+4. Cada nodo calcula su parte con 4 pthreads, leyendo la entrada a través del DSM. Las páginas que no tiene le llegan por la red, así que los archivos solo tienen que estar en la máquina del origen.
+5. Barrera. El origen compara el resultado completo con el mismo cálculo hecho localmente, lo guarda en `output/` y publica el veredicto en el segmento de información.
+6. Barrera final. Todos imprimen el veredicto y llaman a `dsm_free`; el último nodo en salir libera cada segmento.
 
-`wordcount` cuenta palabras, líneas y letras de un texto. Cada nodo carga su tramo de bytes y cuenta el tramo que cargó el nodo siguiente, así siempre lee páginas escritas por otro. Una palabra cuenta en el tramo donde empieza, aunque para saberlo lea el byte anterior en otra página. El archivo de prueba es el enunciado del proyecto en texto plano (`data/enunciado_dsm.txt`, 15 905 bytes).
+El segmento de información usa el proceso `proceso de datos + 100 × nodos`, que tiene el mismo resto que el proceso de datos y por eso vive en el mismo home que el ancla de los datos. Si viviera en otro nodo, ocuparía el principio de su rango y un segmento de datos que no cabe en su ancla no podría continuar ahí.
 
-`matmul` calcula C = A × B con matrices leídas de archivo (`data/matriz_a.txt` y `data/matriz_b.txt`, 96 × 96). Cada nodo carga su bloque de filas de A y de B y calcula su bloque de filas de C. Para eso lee B completa, así que trae por la red las filas que cargaron los demás. Los bloques de C que comparten una página obligan a invalidaciones y write-back entre nodos, lo que ejercita la coherencia.
+`wordcount` cuenta palabras, líneas y letras de un texto. Cada nodo cuenta su tramo de bytes; una palabra cuenta en el tramo donde empieza, aunque para saberlo lea el byte anterior en otra página. Todos suman los resultados de las páginas de control. Archivos de prueba: el enunciado del proyecto en texto plano (`data/enunciado_dsm.txt`, 15 905 bytes) y `data/texto_grande.txt` (el enunciado 400 veces, 6.4 MB, generado con `make`).
+
+`matmul` calcula C = A × B con matrices leídas de archivo (`data/matriz_a.txt` y `data/matriz_b.txt`, 96 × 96). Cada nodo calcula un bloque de filas de C y para eso lee B completa por el DSM. Los bloques de C que comparten una página obligan a invalidaciones y write-back entre nodos, lo que ejercita la coherencia.
+
+`imgfilter` convierte una foto (PPM P6) a un dibujo a lápiz en blanco y negro: escala de grises y bordes con Sobel, invertidos. La imagen se reparte en bandas de filas, una por nodo, y cada banda es su propio segmento, con su home en un nodo distinto. Sobel usa las filas vecinas, así que en los bordes de su banda cada nodo lee filas de otra banda. La foto de prueba es "Aldrin Apollo 11" de la NASA, de dominio público (1280 × 1288).
 
 # 11. Pruebas y resultados
 
 `make test` ejecuta dos pruebas automáticas. `test_memoria` usa un nodo y comprueba que una lectura deja la página en S, que una escritura la pasa a M, que los accesos con permiso no generan fallos, que liberar devuelve las páginas a I en cero y que la región se puede crear de nuevo. `test_coherencia` usa dos procesos: el nodo 1 lee datos que el nodo 0 escribió, escribe en la misma página, el nodo 0 lee esos cambios (write-back), el nodo 0 escribe e invalida la copia del nodo 1, y el nodo 1 consulta las estadísticas y la tabla de páginas del nodo 0 por la red. La prueba se repitió cinco veces seguidas sin fallos.
 
-Con tres nodos en una misma computadora (`apps/local3.conf`) se obtuvo:
+Con tres nodos en una misma computadora (`apps/local3.conf`), lanzando desde un solo nodo, se obtuvo:
 
 | Aplicación | Resultado | Verificación |
 |---|---|---|
 | `wordcount` | 2180 palabras, 246 líneas; letras más frecuentes e = 1502, a = 1236, o = 975, s = 952, r = 782 | CORRECTA |
 | `matmul` | C[0][0] = 28.7452, C[95][95] = 4.5012, suma de C = 9787.8401 | CORRECTA (0 de 9216 celdas distintas) |
+| `imgfilter` | suma de la salida = 267 160 365 | CORRECTA (0 de 1 648 640 píxeles distintos) |
 
-Los tres nodos imprimieron los mismos resultados. `test_coherencia` además reserva un segmento de 20 páginas con 16 páginas por nodo: el nodo 0 aporta las páginas 2 a 15 y el nodo 1 las 16 a 21, y los dos nodos leen y escriben a ambos lados del límite.
+Se probó también lanzar desde el nodo 2 y con un archivo inexistente: en ese caso los demás nodos imprimen que el origen canceló la corrida. `test_coherencia` además reserva un segmento de 20 páginas con 16 páginas por nodo: el nodo 0 aporta las páginas 2 a 15 y el nodo 1 las 16 a 21, y los dos nodos leen y escriben a ambos lados del límite.
 
 ## 11.1 Rendimiento
 
-`make bench` corre las tres aplicaciones con 1, 2 y 3 nodos en una misma computadora (un proceso por nodo, 4 MB por nodo, 4 pthreads por nodo) y cada nodo mide tres tiempos: la carga de sus datos al DSM, el cálculo distribuido (entre la primera y la segunda barrera) y el mismo cálculo completo hecho localmente sin DSM. Para un escenario con mucha memoria, `wordcount` usa `data/texto_grande.txt`, el enunciado repetido 400 veces (6.4 MB), y `imgfilter` la foto de 1280 x 1288 (6.4 MB en el DSM entre entrada y salida). La tabla resume el nodo 0 de una ejecución en una computadora con WSL2:
+`make bench` corre las tres aplicaciones con 1, 2 y 3 nodos en una misma computadora (un proceso por nodo, 4 MB por nodo, 4 pthreads por nodo). El nodo 0 es el origen. Cada nodo mide la carga (desde que el origen publica los tamaños hasta que la entrada está en el DSM y todos pasaron la primera barrera) y el cálculo distribuido (entre la primera y la segunda barrera); el origen mide además el mismo cálculo completo hecho localmente sin DSM. La tabla resume el nodo 0 de una ejecución en una computadora con WSL2:
 
 | Aplicación | Nodos | Memoria en el DSM | Carga | Cálculo distribuido | Secuencial local | Fallos (nodo 0) |
 |---|---|---|---|---|---|---|
-| `matmul` 96 x 96 | 1 | 216 KB | 7.7 ms | 1.6 ms | 0.8 ms | 56 |
-| `matmul` 96 x 96 | 2 | 216 KB | 8.8 ms | 10.6 ms | 0.8 ms | 51 |
-| `matmul` 96 x 96 | 3 | 216 KB | 9.3 ms | 10.3 ms | 0.9 ms | 64 |
+| `matmul` 96 x 96 | 1 | 216 KB | 8.3 ms | 1.6 ms | 0.9 ms | 57 |
+| `matmul` 96 x 96 | 2 | 216 KB | 8.0 ms | 13.3 ms | 0.8 ms | 61 |
+| `matmul` 96 x 96 | 3 | 216 KB | 460 ms | 13.7 ms | 0.9 ms | 85 |
 | `wordcount` 6.4 MB | 1 | 6.4 MB | no cabe (4 MB) | | | |
-| `wordcount` 6.4 MB | 2 | 6.4 MB (4 MB en el nodo 0, 2.4 MB en el nodo 1) | 197 ms | 220 ms | 16.7 ms | 1561 |
-| `wordcount` 6.4 MB | 3 | 6.4 MB (4 MB en el nodo 1, 2.4 MB en el nodo 2) | 193 ms | 246 ms | 17.5 ms | 1044 |
+| `wordcount` 6.4 MB | 2 | 6.4 MB (4 MB en el nodo 0, 2.4 MB en el nodo 1) | 408 ms | 184 ms | 20.1 ms | 1561 |
+| `wordcount` 6.4 MB | 3 | 6.4 MB (4 MB en el nodo 1, 2.4 MB en el nodo 2) | 621 ms | 107 ms | 16.8 ms | 1565 |
 | `imgfilter` 1280 x 1288 | 1 | 6.4 MB | no cabe (4 MB) | | | |
-| `imgfilter` 1280 x 1288 | 2 | 6.4 MB | 122 ms | 19 ms | 41 ms | 1015 |
-| `imgfilter` 1280 x 1288 | 3 | 6.4 MB | 155 ms | 45 ms | 42 ms | 953 |
+| `imgfilter` 1280 x 1288 | 2 | 6.4 MB | 345 ms | 134 ms | 41.5 ms | 1620 |
+| `imgfilter` 1280 x 1288 | 3 | 6.4 MB | 387 ms | 412 ms | 40.5 ms | 1629 |
 
 Con un solo nodo, `wordcount` e `imgfilter` no se pueden ejecutar: necesitan 6.4 MB y un nodo aporta 4 MB. Con dos o tres nodos funcionan, y en `wordcount` el segmento del texto ocupa memoria de dos nodos.
 
-En una sola computadora el DSM no acelera el cálculo: todos los nodos comparten los mismos núcleos y cada fallo de página cuesta un viaje por TCP local, de unos 0.1 a 0.2 ms, frente a nanosegundos de un acceso a memoria. En `wordcount` cada página se lee una sola vez y casi no se reutiliza, así que el tiempo es casi todo fallos (1561 fallos en 220 ms). `imgfilter` con 2 nodos es la excepción: cada nodo filtra su banda con 4 pthreads y la mayoría de las páginas que lee son de su propia banda, así que el cálculo distribuido (19 ms) es más rápido que el secuencial de un solo hilo (41 ms). Con 3 nodos hay más bordes entre bandas y más páginas remotas, y la ventaja desaparece. En el laboratorio, con computadoras distintas, el cálculo de cada nodo usa su propio procesador, pero cada fallo cuesta un viaje por la red física; las mismas mediciones se repiten con `bench.sh` adaptando `dsm.conf`.
+La carga es el origen copiando toda la entrada al DSM: cada página que escribe y cuyo home es otro nodo cuesta un fallo y un viaje por la red para obtenerla en M (por eso el origen tiene unos 1600 fallos en `wordcount` e `imgfilter`). El 460 ms de `matmul` con 3 nodos es espera en la primera barrera: en el bench los otros procesos arrancan después del origen.
+
+En una sola computadora el DSM no acelera el cálculo: todos los nodos comparten los mismos núcleos y cada fallo de página cuesta un viaje por TCP local, de unos 0.1 a 0.2 ms, frente a nanosegundos de un acceso a memoria. Como la entrada la escribió el origen, cada nodo la recibe por la red la primera vez que la lee, y con más nodos hay más páginas que viajan (en `imgfilter`, 134 ms con 2 nodos y 412 ms con 3). Lo que el DSM aporta aquí es capacidad: trabajar con datos que no caben en la memoria de un nodo, repartidos entre varios, y que solo una máquina tenga los archivos. En el laboratorio, con computadoras distintas, cada nodo calcula con su propio procesador, pero cada fallo cuesta un viaje por la red física; las mismas mediciones se repiten con `bench.sh` adaptando `dsm.conf`.
 
 La demostración final se hará en computadoras distintas del laboratorio, con un `dsm.conf` que liste sus direcciones IPv4.
 
@@ -206,7 +214,7 @@ La demostración final se hará en computadoras distintas del laboratorio, con u
 1. Copiar la carpeta `EntregaFinal` en cada máquina y ejecutar `make`.
 2. Editar `dsm.conf` con la IPv4 de cada máquina, en el mismo orden en todas, y abrir los puertos `port_base` a `port_base + 3n - 1`.
 3. En cada máquina, iniciar el nodo con su `node_id`: `./dsmnode dsm.conf k`.
-4. En la consola de cada nodo, escribir el mismo comando: `run matmul data/matriz_a.txt data/matriz_b.txt` o `run wordcount data/enunciado_dsm.txt`. Deben participar todos los nodos de `dsm.conf`.
+4. En la consola de un solo nodo, el que tiene los archivos, escribir `run matmul data/matriz_a.txt data/matriz_b.txt`, `run wordcount data/enunciado_dsm.txt` o `run imgfilter data/aldrin.ppm`. Los demás nodos la ejecutan solos y el resultado queda en `output/` del nodo origen. Deben estar en línea todos los nodos de `dsm.conf`.
 5. `stats` muestra las estadísticas de todo el sistema. `pages` abre una vista por nodo (flechas para cambiar de nodo, `q` para salir) con la memoria usada y libre, un mapa de páginas por proceso y las asignaciones. `monitor` muestra los mensajes recibidos y los cambios de estado de los nodos sin interrumpir la consola (Enter para salir). `nodes` muestra qué nodos están en línea.
 
 El archivo `README.md` tiene la tabla completa de parámetros y comandos.
@@ -221,7 +229,7 @@ El DSM cumple con lo pedido en el enunciado: memoria reservada con `mmap`, prote
 
 La decisión que más influyó en el diseño fue no esperar nunca a la red desde el hilo que recibe las respuestas. Separar el hilo de servicio y el hilo de fallos evitó interbloqueos sin agregar timeouts artificiales. La otra decisión importante fue mantener el manejador de señales mínimo: un pipe y un contador atómico bastan para sacar el trabajo del contexto de la señal.
 
-Las aplicaciones no tienen coordinador: los segmentos compartidos con conteo de nodos unidos y las barreras sobre páginas de control bastan para que nodos iguales cooperen sin que ninguno tenga un papel especial.
+Las aplicaciones no tienen un coordinador fijo: cualquier nodo puede lanzar una corrida, es el único que necesita los archivos y los demás reciben la entrada a través del DSM. Los segmentos compartidos con conteo de nodos unidos, el segmento de información y las barreras sobre páginas de control bastan para que los nodos cooperen.
 
 El costo del DSM se ve en los contadores: en `matmul`, cada página de C que dos nodos comparten viaja varias veces entre ellos. Asignar a cada nodo bloques alineados a página reduciría ese tráfico.
 

@@ -23,13 +23,13 @@ run() {
     } > "$conf"
     i=1
     while [ "$i" -lt "$nodes" ]; do
-        "./$app" "$conf" "$i" "$@" > "/tmp/dsm_bench_$i.out" 2>&1 &
+        "./$app" "$conf" "$i" > "/tmp/dsm_bench_$i.out" 2>&1 &
         i=$((i + 1))
     done
     "./$app" "$conf" 0 "$@" > /tmp/dsm_bench_0.out 2>&1
     wait
     echo "== $app con $nodes nodo(s)"
-    cat /tmp/dsm_bench_*.out | grep -E "tiempos|verificación|fallos de página|necesita|Out of memory"
+    cat /tmp/dsm_bench_*.out | grep -E "tiempos|verificación|fallos de página|necesita|ocupa|Out of memory"
     rm -f /tmp/dsm_bench_*.out "$conf"
 }
 
@@ -38,4 +38,3 @@ for nodes in 1 2 3; do
     run "$nodes" wordcount data/texto_grande.txt
     run "$nodes" imgfilter data/aldrin.ppm
 done
-rm -f data/*_lapiz_n*.pgm
