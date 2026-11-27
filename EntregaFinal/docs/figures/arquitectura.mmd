@@ -1,13 +1,14 @@
 flowchart TB
-  subgraph P["Proceso de aplicación (nodo k)"]
+  subgraph P["Proceso dsmnode (nodo k)"]
     APP["Hilos de la aplicación<br/>leen y escriben punteros DSM"]
     SIG["Manejador SIGSEGV<br/>sigaction + SA_SIGINFO"]
     FT["Hilo de fallos<br/>resolveFault"]
     NET["Hilo de red<br/>poll sobre 3 listeners"]
     SVC["Hilo de servicio<br/>PAGE_REQUEST y FREE"]
     HB["Hilos heartbeat y JOIN"]
+    PEND["Solicitudes pendientes<br/>sem_timedwait por solicitud"]
     MEM["Región DSM<br/>memfd: vista en dsm_base + alias RW"]
-    DIR["Tabla de páginas y directorio MSI"]
+    DIR["Tabla de páginas y directorio MSI<br/>protegido con semáforo POSIX"]
   end
   OTROS["Otros nodos"]
   APP -->|"acceso sin permiso"| SIG
@@ -18,5 +19,7 @@ flowchart TB
   NET -->|"encola"| SVC
   SVC -->|"grantPage"| DIR
   FT --> DIR
+  FT --> PEND
+  NET -->|"sem_post al llegar la respuesta"| PEND
   NET -->|"INVALIDATE_ACK"| OTROS
   HB <-->|"puerto heartbeat"| OTROS

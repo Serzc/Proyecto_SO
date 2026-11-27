@@ -1,0 +1,11 @@
+flowchart LR
+  subgraph G["Espacio DSM global: misma dirección en todos los nodos (dsm_base + página x page_size)"]
+    direction LR
+    R0["Rango del nodo 0<br/>páginas 0 a P-1<br/>home: nodo 0"]
+    R1["Rango del nodo 1<br/>páginas P a 2P-1<br/>home: nodo 1"]
+    R2["Rango del nodo 2<br/>páginas 2P a 3P-1<br/>home: nodo 2"]
+    R0 --- R1 --- R2
+  end
+  S["Segmento proc 10 (6.4 MB)<br/>ancla = 10 % 3 = nodo 1"]
+  S -->|"final libre del rango del ancla"| R1
+  S -->|"continúa al inicio del rango siguiente"| R2

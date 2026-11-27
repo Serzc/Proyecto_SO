@@ -1,0 +1,17 @@
+flowchart LR
+  CONF[("dsm.conf<br/>igual en todas las máquinas")]
+  subgraph PC0["Computadora A"]
+    N0["Nodo 0 (dsmnode)<br/>datos: port_base<br/>control: port_base+1<br/>heartbeat: port_base+2"]
+  end
+  subgraph PC1["Computadora B"]
+    N1["Nodo 1 (dsmnode)<br/>datos: port_base+3<br/>control: port_base+4<br/>heartbeat: port_base+5"]
+  end
+  subgraph PC2["Computadora C"]
+    N2["Nodo 2 (dsmnode)<br/>datos: port_base+6<br/>control: port_base+7<br/>heartbeat: port_base+8"]
+  end
+  CONF -.-> N0
+  CONF -.-> N1
+  CONF -.-> N2
+  N0 <-->|"TCP/IPv4: JOIN, HEARTBEAT,<br/>PAGE_REQUEST, PAGE_DATA,<br/>INVALIDATE, ALLOC, QUERY, RUN"| N1
+  N1 <-->|"TCP/IPv4"| N2
+  N0 <-->|"TCP/IPv4"| N2
